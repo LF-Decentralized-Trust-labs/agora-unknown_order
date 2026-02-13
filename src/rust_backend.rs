@@ -17,10 +17,7 @@ use core::{
 use glass_pumpkin::{prime, safe_prime};
 use num_bigint::{BigInt, Sign, ToBigInt};
 use num_integer::Integer;
-use num_traits::{
-    identities::{One, Zero},
-    Num,
-};
+use num_traits::identities::{One, Zero};
 use rand::Rng as RngCore;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
@@ -49,12 +46,7 @@ from_impl!(BigInt::from, i32);
 from_impl!(BigInt::from, i16);
 from_impl!(BigInt::from, i8);
 iter_impl!();
-serdes_impl!(
-    |b: &Bn| b.0.to_str_radix(16),
-    |s: &str| { BigInt::from_str_radix(s, 16).ok() },
-    |b: &Bn| b.0.to_signed_bytes_be(),
-    |s: &[u8]| -> Option<BigInt> { Some(BigInt::from_signed_bytes_be(s)) }
-);
+serdes_impl!();
 zeroize_impl!(|b: &mut Bn| b.0.set_zero());
 binops_impl!(Add, add, AddAssign, add_assign, +, +=);
 binops_impl!(Sub, sub, SubAssign, sub_assign, -, -=);

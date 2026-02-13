@@ -42,25 +42,7 @@ from_impl!(Integer::from, i32);
 from_impl!(Integer::from, i16);
 from_impl!(Integer::from, i8);
 iter_impl!();
-serdes_impl!(
-    |b: &Bn| b.0.to_string_radix(16),
-    |s: &str| { Integer::from_str_radix(s, 16).ok() },
-    |b: &Bn| {
-        let mut digits =
-            b.0.clone()
-                .abs()
-                .to_digits::<u8>(rug::integer::Order::LsfBe);
-        digits.insert(0, if b.0.is_negative() { 1 } else { 0 });
-        digits
-    },
-    |s: &[u8]| {
-        if s.is_empty() {
-            return None;
-        }
-        let result = Integer::from_digits(&s[1..], rug::integer::Order::LsfBe);
-        Some(if s[0] == 1 { -result } else { result })
-    }
-);
+serdes_impl!();
 zeroize_impl!(|b: &mut Bn| b.0 -= b.0.clone());
 
 binops_impl!(Add, add, AddAssign, add_assign, +, +=);

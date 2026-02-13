@@ -836,11 +836,23 @@ impl Serialize for Bn {
     where
         S: Serializer,
     {
-        let bytes = self.to_bytes();
+        let mut bytes = self.to_bytes();
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
         if s.is_human_readable() {
-            alloc::format!("{}{}", self.sign, hex::encode(&bytes)).serialize(s)
+            let hex_str = hex::encode(&bytes);
+            if self.sign.is_negative() {
+                alloc::format!("-{}", hex_str).serialize(s)
+            } else {
+                hex_str.serialize(s)
+            }
         } else {
-            (self.sign, bytes).serialize(s)
+            let is_neg = self.sign.is_negative();
+            let mut out = alloc::vec::Vec::with_capacity(1 + bytes.len());
+            out.push(if is_neg { 1u8 } else { 0u8 });
+            out.extend_from_slice(&bytes);
+            s.serialize_bytes(&out)
         }
     }
 }
@@ -852,39 +864,68 @@ impl<'de> Deserialize<'de> for Bn {
     {
         if d.is_human_readable() {
             let s = alloc::string::String::deserialize(d)?;
-            if let Some(stripped) = s.strip_prefix('-') {
-                let bytes = hex::decode(stripped).map_err(|e| {
-                    de::Error::invalid_value(
-                        de::Unexpected::Str(&s),
-                        &alloc::format!("valid hex: {}", e).as_str(),
-                    )
-                })?;
-                if bytes.is_empty() {
-                    Ok(Self::zero())
-                } else {
-                    let mut bn = Self::from_slice(&bytes);
-                    bn.sign = Sign::Minus;
-                    Ok(bn)
-                }
+            let (is_neg, hex_part) = if let Some(stripped) = s.strip_prefix('-') {
+                (true, stripped)
             } else {
-                let bytes = hex::decode(&s).map_err(|e| {
-                    de::Error::invalid_value(
-                        de::Unexpected::Str(&s),
-                        &alloc::format!("valid hex: {}", e).as_str(),
-                    )
-                })?;
-                let bn = Self::from_slice(&bytes);
-                if bn.is_zero() {
-                    Ok(Self::zero())
-                } else {
-                    Ok(bn)
-                }
+                (false, s.as_str())
+            };
+            let hex_str = if hex_part.len() % 2 != 0 {
+                alloc::format!("0{}", hex_part)
+            } else {
+                alloc::string::String::from(hex_part)
+            };
+            let bytes = hex::decode(&hex_str).map_err(|e| {
+                de::Error::invalid_value(
+                    de::Unexpected::Str(&s),
+                    &alloc::format!("valid hex: {}", e).as_str(),
+                )
+            })?;
+            let bn = if bytes.is_empty() {
+                Self::zero()
+            } else {
+                Self::from_slice(&bytes)
+            };
+            if bn.is_zero() {
+                Ok(Self::zero())
+            } else if is_neg {
+                Ok(-bn)
+            } else {
+                Ok(bn)
             }
         } else {
-            let (sign, value): (Sign, alloc::vec::Vec<u8>) = Deserialize::deserialize(d)?;
-            let mut bn = Self::from_slice(value);
-            bn.sign = sign;
-            Ok(bn)
+            struct BnBytesVisitor;
+
+            impl<'de> Visitor<'de> for BnBytesVisitor {
+                type Value = Bn;
+
+                fn expecting(&self, f: &mut Formatter) -> fmt::Result {
+                    write!(f, "a bytestring")
+                }
+
+                fn visit_bytes<E>(self, s: &[u8]) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    if s.is_empty() {
+                        return Err(de::Error::invalid_length(0, &self));
+                    }
+                    let is_neg = s[0] == 1;
+                    let bn = if s.len() == 1 {
+                        Bn::zero()
+                    } else {
+                        Bn::from_slice(&s[1..])
+                    };
+                    if bn.is_zero() {
+                        Ok(Bn::zero())
+                    } else if is_neg {
+                        Ok(-bn)
+                    } else {
+                        Ok(bn)
+                    }
+                }
+            }
+
+            d.deserialize_bytes(BnBytesVisitor)
         }
     }
 }

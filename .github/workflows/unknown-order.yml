@@ -3,15 +3,15 @@ name: unknown-order
 on:
   pull_request:
     paths-ignore:
-      - *.md
-      - *.sh
-      - LICENSE*
+      - '*.md'
+      - '*.sh'
+      - 'LICENSE*'
   push:
     branches: main
     paths-ignore:
-      - *.md
-      - *.sh
-      - LICENSE*
+      - '*.md'
+      - '*.sh'
+      - 'LICENSE*'
 
 env:
   CARGO_INCREMENTAL: 0

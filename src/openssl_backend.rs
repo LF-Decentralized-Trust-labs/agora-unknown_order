@@ -79,22 +79,7 @@ from_impl!(|d: i32| from_isize(d as isize), i32);
 from_impl!(|d: i16| from_isize(d as isize), i16);
 from_impl!(|d: i8| from_isize(d as isize), i8);
 iter_impl!();
-serdes_impl!(
-    |b: &Bn| b.0.to_hex_str().unwrap(),
-    |s: &str| { BigNum::from_hex_str(s).ok() },
-    |b: &Bn| {
-        let mut digits = b.0.to_vec();
-        digits.insert(0, if b.0.is_negative() { 1 } else { 0 });
-        digits
-    },
-    |s: &[u8]| -> Option<BigNum> {
-        if s.is_empty() {
-            return None;
-        }
-        let result = BigNum::from_slice(&s[1..]).ok()?;
-        Some(if s[0] == 1 { -result } else { result })
-    }
-);
+serdes_impl!();
 zeroize_impl!(|b: &mut Bn| b.0.clear());
 
 impl Add<&Bn> for &Bn {

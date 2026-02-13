@@ -224,18 +224,29 @@ macro_rules! clone_impl {
 }
 
 macro_rules! serdes_impl {
-    ($ser_str:expr, $des_str:expr, $ser_bytes:expr, $des_bytes:expr) => {
+    () => {
         impl serde::Serialize for Bn {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: serde::Serializer,
             {
+                let mut bytes = self.to_bytes();
+                if bytes.is_empty() {
+                    bytes.push(0);
+                }
                 if serializer.is_human_readable() {
-                    let str = $ser_str(self);
-                    serializer.serialize_str(&str)
+                    let hex_str = hex::encode(&bytes);
+                    if *self < Bn::zero() {
+                        serializer.serialize_str(&alloc::format!("-{}", hex_str))
+                    } else {
+                        serializer.serialize_str(&hex_str)
+                    }
                 } else {
-                    let bytes = $ser_bytes(self);
-                    serializer.serialize_bytes(&bytes)
+                    let is_neg = *self < Bn::zero();
+                    let mut out = alloc::vec::Vec::with_capacity(1 + bytes.len());
+                    out.push(if is_neg { 1u8 } else { 0u8 });
+                    out.extend_from_slice(&bytes);
+                    serializer.serialize_bytes(&out)
                 }
             }
         }
@@ -259,10 +270,34 @@ macro_rules! serdes_impl {
                     where
                         E: serde::de::Error,
                     {
-                        let b = $des_str(s).ok_or_else(|| {
-                            serde::de::Error::invalid_value(serde::de::Unexpected::Str(s), &self)
+                        let (is_neg, hex_part) = if let Some(stripped) = s.strip_prefix('-') {
+                            (true, stripped)
+                        } else {
+                            (false, s)
+                        };
+                        let hex_str = if hex_part.len() % 2 != 0 {
+                            alloc::format!("0{}", hex_part)
+                        } else {
+                            alloc::string::String::from(hex_part)
+                        };
+                        let bytes = hex::decode(&hex_str).map_err(|e| {
+                            serde::de::Error::invalid_value(
+                                serde::de::Unexpected::Str(s),
+                                &alloc::format!("valid hex: {}", e).as_str(),
+                            )
                         })?;
-                        Ok(Bn(b))
+                        let bn = if bytes.is_empty() {
+                            Bn::zero()
+                        } else {
+                            Bn::from_slice(&bytes)
+                        };
+                        if bn.is_zero() {
+                            Ok(Bn::zero())
+                        } else if is_neg {
+                            Ok(-bn)
+                        } else {
+                            Ok(bn)
+                        }
                     }
                 }
 
@@ -277,10 +312,22 @@ macro_rules! serdes_impl {
                     where
                         E: serde::de::Error,
                     {
-                        let b = $des_bytes(s).ok_or_else(|| {
-                            serde::de::Error::invalid_value(serde::de::Unexpected::Bytes(s), &self)
-                        })?;
-                        Ok(Bn(b))
+                        if s.is_empty() {
+                            return Err(serde::de::Error::invalid_length(0, &self));
+                        }
+                        let is_neg = s[0] == 1;
+                        let bn = if s.len() == 1 {
+                            Bn::zero()
+                        } else {
+                            Bn::from_slice(&s[1..])
+                        };
+                        if bn.is_zero() {
+                            Ok(Bn::zero())
+                        } else if is_neg {
+                            Ok(-bn)
+                        } else {
+                            Ok(bn)
+                        }
                     }
                 }
 

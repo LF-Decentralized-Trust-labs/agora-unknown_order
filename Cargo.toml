@@ -24,8 +24,8 @@ version = "0.12.0"
 default = ["crypto"]
 crypto = ["crypto-bigint/alloc", "crypto-bigint/serde", "crypto-bigint/default", "crypto-bigint/subtle", "crypto-bigint/getrandom", "crypto-primes", "hex", "multibase", "rand/sys_rng"]
 gmp = ["hex", "rand/default", "rug/num-traits", "num-traits"]
-openssl = ["dep:openssl", "rand/default"]
-rust = ["glass_pumpkin", "num-bigint", "num-integer", "num-traits", "rand/default", "rand_core_06"]
+openssl = ["dep:openssl", "hex", "rand/default"]
+rust = ["glass_pumpkin", "hex", "num-bigint", "num-integer", "num-traits", "rand/default", "rand_core_06"]
 wasm = ["getrandom", "wasm-bindgen", "serde-wasm-bindgen"]
 
 [dependencies]
