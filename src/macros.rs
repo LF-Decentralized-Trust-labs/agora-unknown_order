@@ -105,6 +105,7 @@ macro_rules! neg_impl {
 
 macro_rules! shift_impl {
     (@ref $ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:expr, $($rhs:ty),+) => {$(
+        #[allow(clippy::unnecessary_cast)]
         impl<'a> $ops<$rhs> for &'a Bn {
             type Output = Bn;
 
@@ -113,6 +114,7 @@ macro_rules! shift_impl {
             }
         }
 
+        #[allow(clippy::unnecessary_cast)]
         impl $ops<$rhs> for Bn {
             type Output = Bn;
 
@@ -121,6 +123,7 @@ macro_rules! shift_impl {
             }
         }
 
+        #[allow(clippy::unnecessary_cast)]
         impl $ops_assign<$rhs> for Bn {
             fn $func_assign(&mut self, rhs: $rhs) {
                 let t = $opr(&self.0, rhs);
@@ -316,18 +319,18 @@ macro_rules! from_impl {
 macro_rules! iter_impl {
     () => {
         impl Sum for Bn {
-            fn sum<I: Iterator<Item = Bn>>(mut iter: I) -> Self {
+            fn sum<I: Iterator<Item = Bn>>(iter: I) -> Self {
                 let mut b = Bn::zero();
-                while let Some(i) = iter.next() {
+                for i in iter {
                     b += i;
                 }
                 b
             }
         }
         impl Product for Bn {
-            fn product<I: Iterator<Item = Bn>>(mut iter: I) -> Self {
+            fn product<I: Iterator<Item = Bn>>(iter: I) -> Self {
                 let mut b = Bn::one();
-                while let Some(i) = iter.next() {
+                for i in iter {
                     b *= i;
                 }
                 b

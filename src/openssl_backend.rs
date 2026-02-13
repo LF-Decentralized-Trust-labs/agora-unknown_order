@@ -15,7 +15,7 @@ use core::{
     },
 };
 use openssl::bn::{BigNum, BigNumContext, BigNumRef};
-use rand::RngCore;
+use rand::Rng as RngCore;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
@@ -97,7 +97,7 @@ serdes_impl!(
 );
 zeroize_impl!(|b: &mut Bn| b.0.clear());
 
-impl<'a, 'b> Add<&'b Bn> for &'a Bn {
+impl Add<&Bn> for &Bn {
     type Output = Bn;
 
     fn add(self, rhs: &Self::Output) -> Self::Output {
@@ -107,7 +107,7 @@ impl<'a, 'b> Add<&'b Bn> for &'a Bn {
     }
 }
 
-impl<'a, 'b> Sub<&'b Bn> for &'a Bn {
+impl Sub<&Bn> for &Bn {
     type Output = Bn;
 
     fn sub(self, rhs: &Self::Output) -> Self::Output {
@@ -117,7 +117,7 @@ impl<'a, 'b> Sub<&'b Bn> for &'a Bn {
     }
 }
 
-impl<'a, 'b> Mul<&'b Bn> for &'a Bn {
+impl Mul<&Bn> for &Bn {
     type Output = Bn;
 
     fn mul(self, rhs: &Self::Output) -> Self::Output {
@@ -128,7 +128,7 @@ impl<'a, 'b> Mul<&'b Bn> for &'a Bn {
     }
 }
 
-impl<'a, 'b> Div<&'b Bn> for &'a Bn {
+impl Div<&Bn> for &Bn {
     type Output = Bn;
 
     fn div(self, rhs: &Self::Output) -> Self::Output {
@@ -139,7 +139,7 @@ impl<'a, 'b> Div<&'b Bn> for &'a Bn {
     }
 }
 
-impl<'a, 'b> Rem<&'b Bn> for &'a Bn {
+impl Rem<&Bn> for &Bn {
     type Output = Bn;
 
     fn rem(self, rhs: &Self::Output) -> Self::Output {
@@ -362,7 +362,7 @@ impl Bn {
 
     /// Generate a random value with `n` bits
     pub fn random_bits(n: u32) -> Self {
-        Self::from_rng_bits(n, &mut rand::rngs::OsRng)
+        Self::from_rng_bits(n, &mut rand::rng())
     }
 
     /// Generate a random value less than `n` using the specific random number generator
@@ -375,14 +375,7 @@ impl Bn {
 
     /// Generate a random value between [lower, upper)
     pub fn random_range(lower: &Self, upper: &Self) -> Self {
-        if lower >= upper {
-            panic!("lower bound is greater than or equal to upper bound");
-        }
-        let mut range = BigNum::new().unwrap();
-        BigNumRef::checked_sub(&mut range, &upper.0, &lower.0).unwrap();
-        let mut r = Self::random(&Self(range));
-        r += lower;
-        r
+        Self::random_range_with_rng(lower, upper, &mut rand::rng())
     }
 
     /// Generate a random value between [lower, upper) using the specific random number generator
@@ -396,7 +389,7 @@ impl Bn {
 
     /// Generate a random value with `n` bits using the specific random number generator
     pub fn from_rng_bits(n: u32, rng: &mut impl RngCore) -> Self {
-        let mut t = vec![0u8; (n as usize + 7) / 8];
+        let mut t = vec![0u8; (n as usize).div_ceil(8)];
         rng.fill_bytes(&mut t);
         let mut r = Self::from_slice(&t);
         r.0.set_bit(n as i32).unwrap();
@@ -470,11 +463,52 @@ impl Bn {
         Self(p)
     }
 
+    /// Generate a safe prime with `size` bits with a user-provided rng
+    pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
+        let mut ctx = BigNumContext::new().unwrap();
+        loop {
+            let q = Self::prime_from_rng(size - 1, rng);
+            // p = 2q + 1
+            let mut two_q = BigNum::new().unwrap();
+            BigNumRef::lshift1(&mut two_q, &q.0).unwrap();
+            let one = BigNum::from_u32(1).unwrap();
+            let mut p = BigNum::new().unwrap();
+            BigNumRef::checked_add(&mut p, &two_q, &one).unwrap();
+
+            if BigNumRef::is_prime(&p, 25, &mut ctx).unwrap() {
+                return Self(p);
+            }
+        }
+    }
+
     /// Generate a prime with `size` bits
     pub fn prime(size: usize) -> Self {
         let mut p = BigNum::new().unwrap();
         BigNumRef::generate_prime(&mut p, size as i32, false, None, None).unwrap();
         Self(p)
+    }
+
+    /// Generate a prime with `size` bits with a user-provided rng
+    pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
+        let mut ctx = BigNumContext::new().unwrap();
+        let byte_len = size.div_ceil(8);
+        let extra_bits = byte_len * 8 - size;
+        loop {
+            let mut bytes = vec![0u8; byte_len];
+            rng.fill_bytes(&mut bytes);
+            if extra_bits > 0 {
+                bytes[0] &= u8::MAX >> extra_bits;
+            }
+            let mut candidate = BigNum::from_slice(&bytes).unwrap();
+            // Set MSB to ensure correct bit length
+            candidate.set_bit((size - 1) as i32).unwrap();
+            // Set LSB to ensure odd
+            candidate.set_bit(0).unwrap();
+
+            if BigNumRef::is_prime(&candidate, 25, &mut ctx).unwrap() {
+                return Self(candidate);
+            }
+        }
     }
 
     /// True if a prime number

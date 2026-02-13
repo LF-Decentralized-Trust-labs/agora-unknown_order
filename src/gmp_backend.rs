@@ -12,7 +12,7 @@ use core::{
         ShrAssign, Sub, SubAssign,
     },
 };
-use rand::{Error, RngCore};
+use rand::Rng as RngCore;
 use rug::rand::ThreadRandState;
 use rug::{Assign, Complete, Integer};
 use subtle::{Choice, ConstantTimeEq};
@@ -20,6 +20,7 @@ use zeroize::Zeroize;
 
 /// Big number
 #[derive(Ord, PartialOrd, Hash)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 pub struct Bn(pub(crate) Integer);
 
 clone_impl!(|b: &Bn| b.0.clone());
@@ -45,8 +46,10 @@ serdes_impl!(
     |b: &Bn| b.0.to_string_radix(16),
     |s: &str| { Integer::from_str_radix(s, 16).ok() },
     |b: &Bn| {
-        use num_traits::sign::Signed;
-        let mut digits = (&b.0).abs().to_digits::<u8>(rug::integer::Order::LsfBe);
+        let mut digits =
+            b.0.clone()
+                .abs()
+                .to_digits::<u8>(rug::integer::Order::LsfBe);
         digits.insert(0, if b.0.is_negative() { 1 } else { 0 });
         digits
     },
@@ -222,7 +225,7 @@ impl Bn {
 
     /// Generate a random value with `n` bits
     pub fn random_bits(n: u32) -> Self {
-        Self::from_rng_bits(n, &mut rand::thread_rng())
+        Self::from_rng_bits(n, &mut rand::rng())
     }
 
     /// Generate a random value less than `n` using the specific random number generator
@@ -242,7 +245,7 @@ impl Bn {
 
     /// Generate a random value between [lower, upper)
     pub fn random_range(lower: &Self, upper: &Self) -> Self {
-        Self::random_range_with_rng(lower, upper, &mut rand::rngs::OsRng)
+        Self::random_range_with_rng(lower, upper, &mut rand::rng())
     }
 
     /// Generate a random value between [lower, upper) using the specific random number generator
@@ -256,7 +259,7 @@ impl Bn {
 
     /// Generate a random value with `n` bits using the specific random number generator
     pub fn from_rng_bits(n: u32, rng: &mut impl RngCore) -> Self {
-        let mut t = vec![0u8; (n as usize + 7) / 8];
+        let mut t = vec![0u8; (n as usize).div_ceil(8)];
         rng.fill_bytes(&mut t);
         let mut b = Self::from_slice(t);
         b.0.set_bit(n, true);
@@ -388,9 +391,7 @@ struct GmpRand {
 
 impl Default for GmpRand {
     fn default() -> Self {
-        Self {
-            rng: rand::thread_rng(),
-        }
+        Self { rng: rand::rng() }
     }
 }
 
@@ -400,21 +401,20 @@ impl rug::rand::ThreadRandGen for GmpRand {
     }
 }
 
-impl RngCore for GmpRand {
-    fn next_u32(&mut self) -> u32 {
-        self.rng.next_u32()
+impl rand::TryRng for GmpRand {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.rng.next_u32())
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.rng.next_u64()
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.rng.next_u64())
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.rng.fill_bytes(dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        self.rng.try_fill_bytes(dest)
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        self.rng.fill_bytes(dest);
+        Ok(())
     }
 }
 

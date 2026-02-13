@@ -21,12 +21,13 @@ use num_traits::{
     identities::{One, Zero},
     Num,
 };
-use rand::RngCore;
+use rand::Rng as RngCore;
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
 /// Big number
 #[derive(Ord, PartialOrd, Hash)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 pub struct Bn(pub(crate) BigInt);
 
 clone_impl!(|b: &Bn| b.0.clone());
@@ -241,13 +242,13 @@ impl Bn {
 
     /// Generate a random value less than `n`
     pub fn random(n: &Self) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         Self::from_rng(n, &mut rng)
     }
 
     /// Generate a random value with `n` bits
     pub fn random_bits(n: u32) -> Self {
-        Self::from_rng_bits(n, &mut rand::thread_rng())
+        Self::from_rng_bits(n, &mut rand::rng())
     }
 
     /// Generate a random value less than `n` using the specific random number generator
@@ -270,7 +271,7 @@ impl Bn {
 
     /// Generate a random value between [lower, upper)
     pub fn random_range(lower: &Self, upper: &Self) -> Self {
-        Self::random_range_with_rng(lower, upper, &mut rand::rngs::OsRng)
+        Self::random_range_with_rng(lower, upper, &mut rand::rng())
     }
 
     /// Generate a random value between [lower, upper) using the specific random number generator
@@ -285,7 +286,7 @@ impl Bn {
     /// Generate a random value with `n` bits using the specific random number generator
     pub fn from_rng_bits(n: u32, rng: &mut impl RngCore) -> Self {
         let n = n as usize;
-        let mut t = vec![0u8; (n + 7) / 8];
+        let mut t = vec![0u8; n.div_ceil(8)];
         rng.fill_bytes(&mut t);
         let b = BigInt::from_bytes_be(Sign::Plus, &t);
         Self(&b | BigInt::one() << n)
@@ -358,25 +359,27 @@ impl Bn {
 
     /// Generate a safe prime with `size` bits
     pub fn safe_prime(size: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         Self::safe_prime_from_rng(size, &mut rng)
     }
 
     /// Generate a safe prime with `size` bits with a user-provided rng
     pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
-        let p = safe_prime::from_rng(size, rng).unwrap();
+        let mut adapter = RandAdapter(rng);
+        let p = safe_prime::from_rng(size, &mut adapter).unwrap();
         Self(p.to_bigint().unwrap())
     }
 
     /// Generate a prime with `size` bits
     pub fn prime(size: usize) -> Self {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         Self::prime_from_rng(size, &mut rng)
     }
 
     /// Generate a prime with `size` bits with a user-provided rng
     pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
-        let p = prime::from_rng(size, rng).unwrap();
+        let mut adapter = RandAdapter(rng);
+        let p = prime::from_rng(size, &mut adapter).unwrap();
         Self(p.to_bigint().unwrap())
     }
 
@@ -392,6 +395,28 @@ impl Bn {
     pub fn div_rem(&self, other: &Self) -> (Self, Self) {
         let (d, r) = self.0.div_rem(&other.0);
         (Self(d), Self(r))
+    }
+}
+
+/// Adapter to bridge rand 0.10 `Rng` to rand_core 0.6 `RngCore` for glass_pumpkin compatibility
+struct RandAdapter<'a, R: RngCore>(&'a mut R);
+
+impl<R: RngCore> rand_core_06::RngCore for RandAdapter<'_, R> {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest)
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
+        self.0.fill_bytes(dest);
+        Ok(())
     }
 }
 
