@@ -107,7 +107,7 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  careful:
+  careful-rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +116,40 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-careful
-      - run: cargo careful test tests --all-features --release
+      - run: cargo careful test tests --no-default-features --features=rust --release
+
+  careful-crypto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm cargo-careful
+      - run: cargo careful test tests --no-default-features --features=crypto --release
+
+  careful-openssl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm cargo-careful
+      - run: cargo careful test tests --no-default-features --features=openssl --release
+
+  careful-gmp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm cargo-careful
+      - run: cargo careful test tests --no-default-features --features=gmp --release
 
   clippy-rust:
     runs-on: ubuntu-latest
@@ -203,7 +236,7 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-outdated
-      - run: cargo outdated --root-deps-only --exit-code=1
+      - run: cargo outdated --root-deps-only --exit-code=1 --ignore rand_core,bincode
 
   pants:
     runs-on: ubuntu-latest

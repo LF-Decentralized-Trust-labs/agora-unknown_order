@@ -31,8 +31,8 @@ wasm = ["getrandom", "wasm-bindgen", "serde-wasm-bindgen"]
 [dependencies]
 crypto-bigint = { version = "0.7.0-rc.27", features = ["zeroize"], optional = true }
 crypto-primes = { version = "0.7.0-pre.9", optional = true }
-digest = "0.10"
-getrandom = { version = "0.2", features = ["js"], optional = true }
+digest = "0.11"
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 glass_pumpkin = { version = "1.9", optional = true }
 hex = { version = "0.4", optional = true }
 multibase = { version = "0.9", default-features = false, optional = true }
@@ -50,7 +50,6 @@ zeroize = "1"
 serde-wasm-bindgen = { version = "0.6", optional = true }
 
 [dev-dependencies]
-blake2 = "0.10"
 multibase = "0.9"
 serde_json = "1.0"
-bincode = "1.3"
+bincode = { version = "2.0", features = ["serde"] }

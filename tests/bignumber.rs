@@ -159,21 +159,23 @@ fn serialize_str() {
 
 #[test]
 fn serialize_bytes() {
+    let config = bincode::config::standard();
+
     let n = b10(TEST_PRIMES[2]);
-    let res = bincode::serialize(&n);
+    let res = bincode::serde::encode_to_vec(&n, config);
     assert!(res.is_ok());
     let s = res.unwrap();
-    let nn_res = bincode::deserialize::<BigNumber>(&s);
+    let nn_res = bincode::serde::decode_from_slice::<BigNumber, _>(&s, config);
     assert!(nn_res.is_ok());
-    assert_eq!(nn_res.unwrap(), n);
+    assert_eq!(nn_res.unwrap().0, n);
 
     let n = -BigNumber::from(1);
-    let res = bincode::serialize(&n);
+    let res = bincode::serde::encode_to_vec(&n, config);
     assert!(res.is_ok());
     let s = res.unwrap();
-    let nn_res = bincode::deserialize::<BigNumber>(&s);
+    let nn_res = bincode::serde::decode_from_slice::<BigNumber, _>(&s, config);
     assert!(nn_res.is_ok());
-    assert_eq!(nn_res.unwrap(), n);
+    assert_eq!(nn_res.unwrap().0, n);
 }
 
 #[test]
