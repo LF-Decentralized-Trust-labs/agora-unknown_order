@@ -92,31 +92,25 @@ impl Bn {
     /// Compute (self + rhs) mod n
     pub fn modadd(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self + rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        let mut t = (&self.0 + &rhs.0).complete();
+        t.modulo_mut(&nn.0);
+        Self(t)
     }
 
     /// Compute (self - rhs) mod n
     pub fn modsub(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self - rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        let mut t = (&self.0 - &rhs.0).complete();
+        t.modulo_mut(&nn.0);
+        Self(t)
     }
 
     /// Compute (self * rhs) mod n
     pub fn modmul(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self * rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        let mut t = (&self.0 * &rhs.0).complete();
+        t.modulo_mut(&nn.0);
+        Self(t)
     }
 
     /// Compute (self * 1/rhs) mod n
@@ -125,31 +119,28 @@ impl Bn {
         match rhs.invert(&nn) {
             None => Self::zero(),
             Some(r) => {
-                let mut t = (self * r) % &nn;
-                if t < Bn::zero() {
-                    t += &nn;
-                }
-                t
+                let mut t = (&self.0 * &r.0).complete();
+                t.modulo_mut(&nn.0);
+                Self(t)
             }
         }
     }
 
     /// Compute -self mod n
     pub fn modneg(&self, n: &Self) -> Self {
-        let mut t = self.clone() % n.clone();
-        t = n.clone() - t.clone();
-        t %= n.clone();
-        t
+        let nn = get_mod(n);
+        let r = self.0.modulo_ref(&nn.0).complete();
+        if r.cmp0() == Ordering::Equal {
+            Self::zero()
+        } else {
+            Self((&nn.0 - &r).complete())
+        }
     }
 
     /// Compute self mod n
     pub fn nmod(&self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut out = self.clone() % nn;
-        if out < Self::zero() {
-            out += n;
-        }
-        out
+        Self(self.0.modulo_ref(&nn.0).complete())
     }
 
     /// Computes the multiplicative inverse of this element, failing if the element is zero.
@@ -213,14 +204,14 @@ impl Bn {
     /// Generate a random value less than `n` using the specific random number generator
     pub fn from_rng(n: &Self, rng: &mut impl RngCore) -> Self {
         let mut e_rng = ExternalRand { rng };
-
+        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
         let size = n.0.significant_bits();
+        let mut x = Integer::new();
 
         loop {
-            let b = _random_nbit(size, &mut e_rng);
-
-            if b < n.0 {
-                return Self(b);
+            x.assign(Integer::random_bits(size, &mut rand_state));
+            if x < n.0 {
+                return Self(x);
             }
         }
     }
@@ -298,9 +289,11 @@ impl Bn {
         use rug::integer::IsPrime;
 
         let mut e_rng = ExternalRand { rng };
+        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
+        let mut p = Integer::new();
 
         loop {
-            let mut p = _random_nbit((size - 1) as u32, &mut e_rng);
+            p.assign(Integer::random_bits((size - 1) as u32, &mut rand_state));
 
             // Set the MSB bit so that we're sampling from [2^(size - 2), 2^(size - 1))
             p.set_bit((size - 2) as u32, true);
@@ -323,7 +316,9 @@ impl Bn {
     /// Generate a prime with `size` bits with a user-provided rng
     pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
         let mut e_rng = ExternalRand { rng };
-        let mut p = _random_nbit(size as u32, &mut e_rng);
+        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
+        let mut p = Integer::new();
+        p.assign(Integer::random_bits(size as u32, &mut rand_state));
 
         // Set the MSB bit so that we're sampling from [2^(size - 1), 2^size)
         p.set_bit((size - 1) as u32, true);
@@ -347,14 +342,6 @@ impl Bn {
         let (q, r) = self.0.div_rem_euc_ref(&other.0).complete();
         (Self(q), Self(r))
     }
-}
-
-/// Sample a bignum from [0, 2^size)
-fn _random_nbit<R: rug::rand::ThreadRandGen>(size: u32, gmprng: &mut R) -> Integer {
-    let mut rng = ThreadRandState::new_custom(gmprng);
-    let mut x = Integer::new();
-    x.assign(Integer::random_bits(size, &mut rng));
-    x
 }
 
 struct ExternalRand<'a, T: RngCore> {

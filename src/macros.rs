@@ -9,13 +9,13 @@ macro_rules! binops_impl {
             type Output = Bn;
 
             fn $func(self, rhs: &'b Self::Output) -> Self::Output {
-                Bn(self.0.clone() $opr &rhs.0.clone())
+                Bn(self.0.clone() $opr &rhs.0)
             }
         }
 
         impl<'b> $ops_assign<&'b Bn> for Bn {
             fn $func_assign(&mut self, rhs: &'b Bn) {
-                self.0 $opr_assign rhs.0.clone();
+                self.0 $opr_assign &rhs.0;
             }
         }
 

@@ -137,39 +137,44 @@ impl Rem<&Bn> for &Bn {
 
 impl<'b> AddAssign<&'b Bn> for Bn {
     fn add_assign(&mut self, rhs: &'b Bn) {
-        let b = self.clone();
-        BigNumRef::checked_add(&mut self.0, &b.0, &rhs.0).unwrap();
+        let mut result = BigNum::new().unwrap();
+        BigNumRef::checked_add(&mut result, &self.0, &rhs.0).unwrap();
+        self.0 = result;
     }
 }
 
 impl<'b> SubAssign<&'b Bn> for Bn {
     fn sub_assign(&mut self, rhs: &'b Bn) {
-        let b = self.clone();
-        BigNumRef::checked_sub(&mut self.0, &b.0, &rhs.0).unwrap();
+        let mut result = BigNum::new().unwrap();
+        BigNumRef::checked_sub(&mut result, &self.0, &rhs.0).unwrap();
+        self.0 = result;
     }
 }
 
 impl<'b> MulAssign<&'b Bn> for Bn {
     fn mul_assign(&mut self, rhs: &'b Bn) {
         let mut ctx = BigNumContext::new().unwrap();
-        let b = self.clone();
-        BigNumRef::checked_mul(&mut self.0, &b.0, &rhs.0, &mut ctx).unwrap();
+        let mut result = BigNum::new().unwrap();
+        BigNumRef::checked_mul(&mut result, &self.0, &rhs.0, &mut ctx).unwrap();
+        self.0 = result;
     }
 }
 
 impl<'b> DivAssign<&'b Bn> for Bn {
     fn div_assign(&mut self, rhs: &'b Bn) {
         let mut ctx = BigNumContext::new().unwrap();
-        let b = self.clone();
-        BigNumRef::checked_div(&mut self.0, &b.0, &rhs.0, &mut ctx).unwrap();
+        let mut result = BigNum::new().unwrap();
+        BigNumRef::checked_div(&mut result, &self.0, &rhs.0, &mut ctx).unwrap();
+        self.0 = result;
     }
 }
 
 impl<'b> RemAssign<&'b Bn> for Bn {
     fn rem_assign(&mut self, rhs: &'b Bn) {
         let mut ctx = BigNumContext::new().unwrap();
-        let b = self.clone();
-        BigNumRef::checked_rem(&mut self.0, &b.0, &rhs.0, &mut ctx).unwrap();
+        let mut result = BigNum::new().unwrap();
+        BigNumRef::checked_rem(&mut result, &self.0, &rhs.0, &mut ctx).unwrap();
+        self.0 = result;
     }
 }
 
@@ -270,10 +275,11 @@ impl Bn {
 
     /// Compute -self mod n
     pub fn modneg(&self, n: &Self) -> Self {
-        let mut t = self.clone() % n.clone();
-        t = n.clone() - t.clone();
-        t %= n.clone();
-        t
+        let mut ctx = BigNumContext::new().unwrap();
+        let mut t = BigNum::new().unwrap();
+        let zero = BigNum::new().unwrap();
+        BigNumRef::mod_sub(&mut t, &zero, &self.0, &n.0, &mut ctx).unwrap();
+        Bn(t)
     }
 
     /// Compute self mod n
@@ -415,15 +421,16 @@ impl Bn {
         let mut r = (other.clone(), self.clone());
 
         while !r.0.is_zero() {
-            let q = r.1.clone() / r.0.clone();
-            let f = |mut r: (Self, Self)| {
-                swap(&mut r.0, &mut r.1);
-                r.0 -= q.clone() * r.1.clone();
-                r
-            };
-            r = f(r);
-            s = f(s);
-            t = f(t);
+            let q = &r.1 / &r.0;
+
+            swap(&mut r.0, &mut r.1);
+            r.0 -= &q * &r.1;
+
+            swap(&mut s.0, &mut s.1);
+            s.0 -= &q * &s.1;
+
+            swap(&mut t.0, &mut t.1);
+            t.0 -= &q * &t.1;
         }
 
         if r.1 >= Self::zero() {

@@ -90,31 +90,19 @@ impl Bn {
     /// Compute (self + rhs) mod n
     pub fn modadd(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self + rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        Self((&self.0 + &rhs.0).mod_floor(&nn.0))
     }
 
     /// Compute (self - rhs) mod n
     pub fn modsub(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self - rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        Self((&self.0 - &rhs.0).mod_floor(&nn.0))
     }
 
     /// Compute (self * rhs) mod n
     pub fn modmul(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut t = (self * rhs) % &nn;
-        if t < Bn::zero() {
-            t += &nn;
-        }
-        t
+        Self((&self.0 * &rhs.0).mod_floor(&nn.0))
     }
 
     /// Compute (self * 1/rhs) mod n
@@ -122,32 +110,25 @@ impl Bn {
         let nn = get_mod(n);
         match rhs.invert(&nn) {
             None => Self::zero(),
-            Some(r) => {
-                let mut t = (self * r) % &nn;
-                if t < Bn::zero() {
-                    t += &nn;
-                }
-                t
-            }
+            Some(r) => Self((&self.0 * &r.0).mod_floor(&nn.0)),
         }
     }
 
     /// Compute -self mod n
     pub fn modneg(&self, n: &Self) -> Self {
-        let mut t = self.clone() % n.clone();
-        t = n.clone() - t.clone();
-        t %= n.clone();
-        t
+        let nn = get_mod(n);
+        let r = self.0.mod_floor(&nn.0);
+        if r.is_zero() {
+            Self::zero()
+        } else {
+            Self(&nn.0 - &r)
+        }
     }
 
     /// Compute self mod n
     pub fn nmod(&self, n: &Self) -> Self {
         let nn = get_mod(n);
-        let mut out = self.clone() % nn;
-        if out < Self::zero() {
-            out += n;
-        }
-        out
+        Self(self.0.mod_floor(&nn.0))
     }
 
     /// Computes the multiplicative inverse of this element, failing if the element is zero.
@@ -156,42 +137,22 @@ impl Bn {
             return None;
         }
 
-        // Euclid's extended algorithm, Bèzout coefficient of `n` is not needed
-        //n is either prime or coprime
-        //
-        //function inverse(a, n)
-        //    t := 0;     newt := 1;
-        //    r := n;     newr := a;
-        //    while newr ≠ 0
-        //        quotient := r div newr
-        //        (t, newt) := (newt, t - quotient * newt)
-        //        (r, newr) := (newr, r - quotient * newr)
-        //    if r > 1 then return "a is not invertible"
-        //    if t < 0 then t := t + n
-        //    return t
-        //
         let (mut t, mut new_t) = (BigInt::zero(), BigInt::one());
-        let (mut r, mut new_r) = (n.clone().0, self.0.clone());
+        let (mut r, mut new_r) = (n.0.clone(), self.0.clone());
 
         while !new_r.is_zero() {
             let quotient = &r / &new_r;
-            let temp_t = t.clone();
-            let temp_new_t = new_t.clone();
 
-            t = temp_new_t.clone();
-            new_t = temp_t - &quotient * temp_new_t;
+            swap(&mut t, &mut new_t);
+            new_t -= &quotient * &t;
 
-            let temp_r = r.clone();
-            let temp_new_r = new_r.clone();
-
-            r = temp_new_r.clone();
-            new_r = temp_r - quotient * temp_new_r;
+            swap(&mut r, &mut new_r);
+            new_r -= quotient * &r;
         }
         if r > BigInt::one() {
-            // Not invertible
             return None;
         } else if t < BigInt::zero() {
-            t += n.clone().0
+            t += &n.0;
         }
 
         Some(Self(t))
@@ -316,36 +277,12 @@ impl Bn {
     }
 
     /// Compute the extended euclid algorithm and return the Bézout coefficients and GCD
-    #[allow(clippy::many_single_char_names)]
     pub fn extended_gcd(&self, other: &Self) -> GcdResult {
-        let mut s = (Self::zero(), Self::one());
-        let mut t = (Self::one(), Self::zero());
-        let mut r = (other.clone(), self.clone());
-
-        while !r.0.is_zero() {
-            let q = r.1.clone() / r.0.clone();
-            let f = |mut r: (Self, Self)| {
-                swap(&mut r.0, &mut r.1);
-                r.0 -= q.clone() * r.1.clone();
-                r
-            };
-            r = f(r);
-            s = f(s);
-            t = f(t);
-        }
-
-        if r.1 >= Self::zero() {
-            GcdResult {
-                gcd: r.1,
-                x: s.1,
-                y: t.1,
-            }
-        } else {
-            GcdResult {
-                gcd: Self::zero() - r.1,
-                x: Self::zero() - s.1,
-                y: Self::zero() - t.1,
-            }
+        let result = self.0.extended_gcd(&other.0);
+        GcdResult {
+            gcd: Self(result.gcd),
+            x: Self(result.x),
+            y: Self(result.y),
         }
     }
 
