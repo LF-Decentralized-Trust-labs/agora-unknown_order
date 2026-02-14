@@ -294,8 +294,7 @@ impl Bn {
 
     /// Generate a safe prime with `size` bits with a user-provided rng
     pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
-        let mut adapter = RandAdapter(rng);
-        let p = safe_prime::from_rng(size, &mut adapter).unwrap();
+        let p = safe_prime::from_rng(size, rng).unwrap();
         Self(p.to_bigint().unwrap())
     }
 
@@ -307,8 +306,7 @@ impl Bn {
 
     /// Generate a prime with `size` bits with a user-provided rng
     pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
-        let mut adapter = RandAdapter(rng);
-        let p = prime::from_rng(size, &mut adapter).unwrap();
+        let p = prime::from_rng(size, rng).unwrap();
         Self(p.to_bigint().unwrap())
     }
 
@@ -324,28 +322,6 @@ impl Bn {
     pub fn div_rem(&self, other: &Self) -> (Self, Self) {
         let (d, r) = self.0.div_rem(&other.0);
         (Self(d), Self(r))
-    }
-}
-
-/// Adapter to bridge rand 0.10 `Rng` to rand_core 0.6 `RngCore` for glass_pumpkin compatibility
-struct RandAdapter<'a, R: RngCore>(&'a mut R);
-
-impl<R: RngCore> rand_core_06::RngCore for RandAdapter<'_, R> {
-    fn next_u32(&mut self) -> u32 {
-        self.0.next_u32()
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0.next_u64()
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core_06::Error> {
-        self.0.fill_bytes(dest);
-        Ok(())
     }
 }
 

@@ -25,7 +25,7 @@ default = ["crypto"]
 crypto = ["crypto-bigint/alloc", "crypto-bigint/serde", "crypto-bigint/default", "crypto-bigint/subtle", "crypto-bigint/getrandom", "crypto-primes", "hex", "multibase", "rand/sys_rng"]
 gmp = ["hex", "rand/default", "rug/num-traits", "num-traits"]
 openssl = ["dep:openssl", "hex", "rand/default"]
-rust = ["glass_pumpkin", "hex", "num-bigint", "num-integer", "num-traits", "rand/default", "rand_core_06"]
+rust = ["glass_pumpkin", "hex", "num-bigint", "num-integer", "num-traits", "rand/default"]
 wasm = ["getrandom", "wasm-bindgen", "serde-wasm-bindgen"]
 
 [dependencies]
@@ -33,7 +33,7 @@ crypto-bigint = { version = "0.7.0-rc.27", features = ["zeroize"], optional = tr
 crypto-primes = { version = "0.7.0-pre.9", optional = true }
 digest = "0.11"
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-glass_pumpkin = { version = "1.9", optional = true }
+glass_pumpkin = { version = "1.10", optional = true }
 hex = { version = "0.4", optional = true }
 multibase = { version = "0.9", default-features = false, optional = true }
 num-bigint = { version = "0.4", optional = true }
@@ -41,7 +41,6 @@ num-integer = { version = "0.1", optional = true }
 num-traits = { version = "0.2", optional = true }
 openssl = { version = "^0.10.75", optional = true }
 rand = { version = "0.10", default-features = false }
-rand_core_06 = { package = "rand_core", version = "0.6", optional = true }
 rug = { version = "1.28", default-features = false, features = ["integer", "rand", "std"], optional = true }
 serde = { version = "1.0", features = ["alloc", "serde_derive"] }
 subtle = "2.6"
