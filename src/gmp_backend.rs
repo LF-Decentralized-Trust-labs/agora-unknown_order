@@ -114,8 +114,8 @@ impl ConstantTimeEq for Bn {
         let rhs = other.0.as_limbs();
         let mut difference = 0;
         for index in 0..lhs.len().max(rhs.len()) {
-            let lhs_limb = lhs.get(index).copied().map_or(0, core::convert::identity);
-            let rhs_limb = rhs.get(index).copied().map_or(0, core::convert::identity);
+            let lhs_limb = lhs.get(index).copied().unwrap_or(0);
+            let rhs_limb = rhs.get(index).copied().unwrap_or(0);
             difference |= lhs_limb ^ rhs_limb;
         }
         u8::from(self.0.is_negative()).ct_eq(&u8::from(other.0.is_negative()))

@@ -910,8 +910,8 @@ impl ConstantTimeEq for Bn {
         let rhs = other.value.as_words();
         let mut difference: Word = 0;
         for index in 0..lhs.len().max(rhs.len()) {
-            let lhs_word = lhs.get(index).copied().map_or(0, core::convert::identity);
-            let rhs_word = rhs.get(index).copied().map_or(0, core::convert::identity);
+            let lhs_word = lhs.get(index).copied().unwrap_or(0);
+            let rhs_word = rhs.get(index).copied().unwrap_or(0);
             difference |= lhs_word ^ rhs_word;
         }
         self.sign.ct_eq(&other.sign) & difference.ct_eq(&0)

@@ -89,7 +89,7 @@ pub(crate) fn decode_hex(encoded: &str) -> Option<alloc::vec::Vec<u8>> {
         bytes.push(nibble(encoded[0])?);
         encoded = &encoded[1..];
     }
-    for pair in encoded.chunks_exact(2) {
+    for pair in encoded.as_chunks::<2>().0 {
         bytes.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(bytes)
