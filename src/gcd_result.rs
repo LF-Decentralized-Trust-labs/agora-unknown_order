@@ -5,11 +5,11 @@
 
 /// GcdResult encapsulates the gcd result and the Bézout coefficients
 #[derive(Debug, Clone)]
-pub struct GcdResult {
+pub struct GcdResult<T> {
     /// Quotient
-    pub gcd: crate::BigNumber,
+    pub gcd: T,
     /// Bézout coefficient
-    pub x: crate::BigNumber,
+    pub x: T,
     /// Bézout coefficient
-    pub y: crate::BigNumber,
+    pub y: T,
 }
