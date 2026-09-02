@@ -77,6 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested random bit lengths, error paths, large values, and an RSA round trip.
 - Test serde round trips with Postcard, CBOR, JSON, TOML, and YAML.
 - Make the build and test scripts fail immediately and include all-feature builds and tests.
+- Keep warning-denied Clippy builds compatible with the lint set in Rust 1.98.
 
 ### v0.12.0
 
