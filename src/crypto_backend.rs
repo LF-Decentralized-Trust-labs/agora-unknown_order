@@ -2,12 +2,11 @@
     Copyright Michael Lodder. All Rights Reserved.
     SPDX-License-Identifier: Apache-2.0
 */
-use crate::*;
-use core::hash::Hasher;
+use crate::{GcdResult, decode_signed_hex, encode_signed_hex};
 use core::{
-    cmp::{self, Ordering},
+    cmp::Ordering,
     fmt::{self, Binary, Debug, Display, Formatter, LowerHex, Octal, UpperHex},
-    hash::Hash,
+    hash::{Hash, Hasher},
     iter::{Product, Sum},
     mem,
     ops::{
@@ -16,23 +15,27 @@ use core::{
     },
     str::FromStr,
 };
-use crypto_bigint::rand_core::CryptoRng;
 use crypto_bigint::{
+    BitOps, BoxedUint, ConcatenatingMul, Gcd, Integer, Limb, NonZero, Odd, RandomBits, RandomMod,
+    Resize, Word,
     modular::{BoxedMontyForm, BoxedMontyParams},
-    rand_core, BoxedUint, CheckedAdd, CheckedSub, Integer, NonZero, Odd, RandomBits, RandomMod,
-    Resize,
 };
+use rand_core::CryptoRng;
 use serde::{
-    de::{self, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
 };
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+/// The sign of a [`BigNumber`](crate::crypto::BigNumber).
 pub enum Sign {
+    /// A negative value.
     Minus,
+    /// Zero, which has no sign.
     None,
+    /// A positive value.
     Plus,
 }
 
@@ -200,24 +203,65 @@ pub struct Bn {
     pub(crate) value: BoxedUint,
 }
 
-/// Normalize two BoxedUint values to the same precision
-fn normalize(a: &BoxedUint, b: &BoxedUint) -> (BoxedUint, BoxedUint) {
-    let prec = a.bits_precision().max(b.bits_precision()).max(64);
-    (a.clone().resize(prec), b.clone().resize(prec))
+/// Return the smallest limb-aligned precision capable of storing `bits` bits.
+fn precision_for_bits(bits: u32) -> u32 {
+    bits.max(1).next_multiple_of(Limb::BITS)
 }
 
-/// Normalize three BoxedUint values to the same precision
-fn normalize3(a: &BoxedUint, b: &BoxedUint, c: &BoxedUint) -> (BoxedUint, BoxedUint, BoxedUint) {
-    let prec = a
-        .bits_precision()
-        .max(b.bits_precision())
-        .max(c.bits_precision())
-        .max(64);
-    (
-        a.clone().resize(prec),
-        b.clone().resize(prec),
-        c.clone().resize(prec),
-    )
+/// Remove unused high limbs after an operation grows its working precision.
+fn minimize(value: BoxedUint) -> BoxedUint {
+    let precision = precision_for_bits(value.bits());
+    value.resize(precision)
+}
+
+fn cmp_magnitude(a: &BoxedUint, b: &BoxedUint) -> Ordering {
+    a.cmp_vartime(b)
+}
+
+fn add_magnitudes(a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
+    let (mut value, carry) = a.carrying_add(b, Limb::ZERO);
+    if carry != Limb::ZERO {
+        let precision = value.bits_precision() + Limb::BITS;
+        value = value.resize(precision);
+        let last = value.as_words().len() - 1;
+        value.as_mut_words()[last] = carry.0;
+    }
+    value
+}
+
+fn add_magnitudes_owned(mut value: BoxedUint, rhs: &BoxedUint) -> BoxedUint {
+    if value.bits_precision() < rhs.bits_precision() {
+        value = value.resize(rhs.bits_precision());
+    }
+    let overflow = value.overflowing_add_assign(rhs);
+    if bool::from(overflow) {
+        let precision = value.bits_precision() + Limb::BITS;
+        value = value.resize(precision);
+        let last = value.as_words().len() - 1;
+        value.as_mut_words()[last] = 1;
+    }
+    value
+}
+
+fn add_magnitudes_owned_pair(mut lhs: BoxedUint, mut rhs: BoxedUint) -> BoxedUint {
+    if lhs.bits_precision() < rhs.bits_precision() {
+        mem::swap(&mut lhs, &mut rhs);
+    }
+    add_magnitudes_owned(lhs, &rhs)
+}
+
+fn sub_magnitudes(a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
+    minimize(sub_magnitudes_fixed(a, b))
+}
+
+fn sub_magnitudes_owned(mut value: BoxedUint, rhs: &BoxedUint) -> BoxedUint {
+    value -= rhs;
+    minimize(value)
+}
+
+fn sub_magnitudes_fixed(a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
+    let (value, _) = a.borrowing_sub(b, Limb::ZERO);
+    value
 }
 
 impl Clone for Bn {
@@ -240,18 +284,7 @@ impl Default for Bn {
 
 impl Display for Bn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let bytes = self.value.to_be_bytes();
-        let lz = self.value.leading_zeros() / 8;
-        let start = lz as usize;
-        let slice = if start < bytes.len() {
-            &bytes[start..]
-        } else {
-            // All zeros or empty
-            &[0u8][..]
-        };
-        let repr = multibase::encode(multibase::Base::Base10, slice);
-        // The leading digit will be a '9' to indicate the encoding so drop it
-        write!(f, "{}{}", self.sign, &repr[1..])
+        write!(f, "{}{}", self.sign, self.value.to_string_radix_vartime(10))
     }
 }
 
@@ -263,45 +296,27 @@ impl Debug for Bn {
 
 impl Binary for Bn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.sign)?;
-        let bytes = self.value.to_be_bytes();
-        for b in bytes.iter() {
-            write!(f, "{:b}", b)?;
-        }
-        Ok(())
+        write!(f, "{}{}", self.sign, self.value.to_string_radix_vartime(2))
     }
 }
 
 impl Octal for Bn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.sign)?;
-        let bytes = self.value.to_be_bytes();
-        for b in bytes.iter() {
-            write!(f, "{:o}", b)?;
-        }
-        Ok(())
+        write!(f, "{}{}", self.sign, self.value.to_string_radix_vartime(8))
     }
 }
 
 impl LowerHex for Bn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.sign)?;
-        let bytes = self.value.to_be_bytes();
-        for b in bytes.iter() {
-            write!(f, "{:x}", b)?;
-        }
-        Ok(())
+        write!(f, "{}{}", self.sign, self.value.to_string_radix_vartime(16))
     }
 }
 
 impl UpperHex for Bn {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.sign)?;
-        let bytes = self.value.to_be_bytes();
-        for b in bytes.iter() {
-            write!(f, "{:X}", b)?;
-        }
-        Ok(())
+        let mut value = self.value.to_string_radix_vartime(16);
+        value.make_ascii_uppercase();
+        write!(f, "{}{}", self.sign, value)
     }
 }
 
@@ -312,8 +327,7 @@ impl PartialEq for Bn {
         if self.sign != other.sign {
             return false;
         }
-        let (lv, rv) = normalize(&self.value, &other.value);
-        lv == rv
+        cmp_magnitude(&self.value, &other.value) == Ordering::Equal
     }
 }
 
@@ -330,11 +344,10 @@ impl Ord for Bn {
             return scmp;
         }
 
-        let (lv, rv) = normalize(&self.value, &other.value);
         match self.sign {
             Sign::None => Ordering::Equal,
-            Sign::Plus => lv.cmp(&rv),
-            Sign::Minus => rv.cmp(&lv),
+            Sign::Plus => cmp_magnitude(&self.value, &other.value),
+            Sign::Minus => cmp_magnitude(&other.value, &self.value),
         }
     }
 }
@@ -342,7 +355,12 @@ impl Ord for Bn {
 impl Hash for Bn {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.sign.hash(state);
-        self.value.to_be_bytes().hash(state);
+        let words = self.value.as_words();
+        let significant_words = words
+            .iter()
+            .rposition(|word| *word != 0)
+            .map_or(&words[..0], |last| &words[..=last]);
+        significant_words.hash(state);
     }
 }
 
@@ -353,7 +371,7 @@ macro_rules! from_uint_impl {
                 fn from(value: $type) -> Self {
                     Self {
                         sign: if value != 0 { Sign::Plus } else { Sign::None },
-                        value: BoxedUint::from(value as u64)
+                        value: minimize(BoxedUint::from(value))
                     }
                 }
             }
@@ -367,13 +385,13 @@ macro_rules! from_sint_impl {
             impl From<$stype> for Bn {
                 fn from(value: $stype) -> Self {
                     let (sign, value) = match 0.cmp(&value) {
-                            Ordering::Greater => (Sign::Minus, (-value) as $utype),
+                            Ordering::Greater => (Sign::Minus, value.unsigned_abs() as $utype),
                             Ordering::Equal => (Sign::None, 0 as $utype),
                             Ordering::Less => (Sign::Plus, value as $utype),
                     };
                     Self {
                         sign,
-                        value: BoxedUint::from(value as u64)
+                        value: minimize(BoxedUint::from(value))
                     }
                 }
             }
@@ -401,7 +419,7 @@ macro_rules! ops_impl {
 
         impl $ops_assign<$rhs> for Bn {
             fn $func_assign(&mut self, rhs: $rhs) {
-                *self = &*self $opr &Self::from(rhs);
+                *self $opr_assign Self::from(rhs);
             }
         }
     )*};
@@ -415,7 +433,7 @@ impl From<usize> for Bn {
     fn from(value: usize) -> Self {
         Self {
             sign: if value == 0 { Sign::None } else { Sign::Plus },
-            value: BoxedUint::from(value as u64),
+            value: minimize(BoxedUint::from(value as u64)),
         }
     }
 }
@@ -456,23 +474,19 @@ impl<'a> Add<&'a Bn> for &Bn {
         match (self.sign, rhs.sign) {
             (_, Sign::None) => self.clone(),
             (Sign::None, _) => rhs.clone(),
-            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => {
-                let (lv, rv) = normalize(&self.value, &rhs.value);
-                Bn {
-                    sign: self.sign,
-                    value: Option::from(lv.checked_add(&rv)).expect("overflow"),
-                }
-            }
+            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes(&self.value, &rhs.value),
+            },
             (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => {
-                let (lv, rv) = normalize(&self.value, &rhs.value);
-                match lv.cmp(&rv) {
+                match cmp_magnitude(&self.value, &rhs.value) {
                     Ordering::Less => Bn {
                         sign: rhs.sign,
-                        value: Option::from(rv.checked_sub(&lv)).unwrap(),
+                        value: sub_magnitudes(&rhs.value, &self.value),
                     },
                     Ordering::Greater => Bn {
                         sign: self.sign,
-                        value: Option::from(lv.checked_sub(&rv)).unwrap(),
+                        value: sub_magnitudes(&self.value, &rhs.value),
                     },
                     Ordering::Equal => Bn::default(),
                 }
@@ -485,7 +499,7 @@ impl Add<Bn> for &Bn {
     type Output = Bn;
 
     fn add(self, rhs: Bn) -> Self::Output {
-        self + &rhs
+        rhs + self
     }
 }
 
@@ -493,7 +507,27 @@ impl Add<&Bn> for Bn {
     type Output = Self;
 
     fn add(self, rhs: &Bn) -> Self::Output {
-        &self + rhs
+        match (self.sign, rhs.sign) {
+            (_, Sign::None) => self,
+            (Sign::None, _) => rhs.clone(),
+            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes_owned(self.value, &rhs.value),
+            },
+            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => {
+                match cmp_magnitude(&self.value, &rhs.value) {
+                    Ordering::Less => Bn {
+                        sign: rhs.sign,
+                        value: sub_magnitudes(&rhs.value, &self.value),
+                    },
+                    Ordering::Greater => Bn {
+                        sign: self.sign,
+                        value: sub_magnitudes_owned(self.value, &rhs.value),
+                    },
+                    Ordering::Equal => Bn::zero(),
+                }
+            }
+        }
     }
 }
 
@@ -501,7 +535,27 @@ impl Add for Bn {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        &self + &rhs
+        match (self.sign, rhs.sign) {
+            (_, Sign::None) => self,
+            (Sign::None, _) => rhs,
+            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes_owned_pair(self.value, rhs.value),
+            },
+            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => {
+                match cmp_magnitude(&self.value, &rhs.value) {
+                    Ordering::Less => Bn {
+                        sign: rhs.sign,
+                        value: sub_magnitudes_owned(rhs.value, &self.value),
+                    },
+                    Ordering::Greater => Bn {
+                        sign: self.sign,
+                        value: sub_magnitudes_owned(self.value, &rhs.value),
+                    },
+                    Ordering::Equal => Bn::zero(),
+                }
+            }
+        }
     }
 }
 
@@ -526,23 +580,19 @@ impl<'a> Sub<&'a Bn> for &Bn {
         match (self.sign, rhs.sign) {
             (_, Sign::None) => self.clone(),
             (Sign::None, _) => -rhs.clone(),
-            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => {
-                let (lv, rv) = normalize(&self.value, &rhs.value);
-                Bn {
-                    sign: self.sign,
-                    value: Option::from(lv.checked_add(&rv)).unwrap(),
-                }
-            }
+            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes(&self.value, &rhs.value),
+            },
             (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => {
-                let (lv, rv) = normalize(&self.value, &rhs.value);
-                match lv.cmp(&rv) {
+                match cmp_magnitude(&self.value, &rhs.value) {
                     Ordering::Less => Bn {
                         sign: -self.sign,
-                        value: Option::from(rv.checked_sub(&lv)).unwrap(),
+                        value: sub_magnitudes(&rhs.value, &self.value),
                     },
                     Ordering::Greater => Bn {
                         sign: self.sign,
-                        value: Option::from(lv.checked_sub(&rv)).unwrap(),
+                        value: sub_magnitudes(&self.value, &rhs.value),
                     },
                     Ordering::Equal => Bn::zero(),
                 }
@@ -555,7 +605,7 @@ impl Sub<Bn> for &Bn {
     type Output = Bn;
 
     fn sub(self, rhs: Bn) -> Self::Output {
-        self - &rhs
+        -(rhs - self)
     }
 }
 
@@ -563,7 +613,27 @@ impl Sub<&Bn> for Bn {
     type Output = Self;
 
     fn sub(self, rhs: &Bn) -> Self::Output {
-        &self - rhs
+        match (self.sign, rhs.sign) {
+            (_, Sign::None) => self,
+            (Sign::None, _) => -rhs,
+            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes_owned(self.value, &rhs.value),
+            },
+            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => {
+                match cmp_magnitude(&self.value, &rhs.value) {
+                    Ordering::Less => Bn {
+                        sign: -self.sign,
+                        value: sub_magnitudes(&rhs.value, &self.value),
+                    },
+                    Ordering::Greater => Bn {
+                        sign: self.sign,
+                        value: sub_magnitudes_owned(self.value, &rhs.value),
+                    },
+                    Ordering::Equal => Bn::zero(),
+                }
+            }
+        }
     }
 }
 
@@ -571,7 +641,27 @@ impl Sub for Bn {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        &self - &rhs
+        match (self.sign, rhs.sign) {
+            (_, Sign::None) => self,
+            (Sign::None, _) => -rhs,
+            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => Bn {
+                sign: self.sign,
+                value: add_magnitudes_owned_pair(self.value, rhs.value),
+            },
+            (Sign::Plus, Sign::Plus) | (Sign::Minus, Sign::Minus) => {
+                match cmp_magnitude(&self.value, &rhs.value) {
+                    Ordering::Less => Bn {
+                        sign: -self.sign,
+                        value: sub_magnitudes_owned(rhs.value, &self.value),
+                    },
+                    Ordering::Greater => Bn {
+                        sign: self.sign,
+                        value: sub_magnitudes_owned(self.value, &rhs.value),
+                    },
+                    Ordering::Equal => Bn::zero(),
+                }
+            }
+        }
     }
 }
 
@@ -597,13 +687,9 @@ impl<'a> Mul<&'a Bn> for &Bn {
         if sign == Sign::None {
             return Bn::default();
         }
-        // Use enough precision for the product
-        let prec = (self.value.bits_precision() + rhs.value.bits_precision()).max(64);
-        let lv = self.value.clone().resize(prec);
-        let rv = rhs.value.clone().resize(prec);
         Bn {
             sign,
-            value: lv.checked_mul(&rv).expect("overflow"),
+            value: minimize(self.value.concatenating_mul(&rhs.value)),
         }
     }
 }
@@ -736,40 +822,38 @@ impl RemAssign for Bn {
 }
 
 macro_rules! shift_impl {
-(@ref $ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:expr, $($rhs:ty),+) => {$(
-    #[allow(clippy::unnecessary_cast)]
+(@ref $ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $ref_op:expr, $owned_op:expr, $($rhs:ty),+) => {$(
     impl<'a> $ops<$rhs> for &'a Bn {
         type Output = Bn;
 
         fn $func(self, rhs: $rhs) -> Self::Output {
-            $opr(self, rhs as u32)
+            $ref_op(self, rhs as u32)
         }
     }
 
-    #[allow(clippy::unnecessary_cast)]
     impl $ops<$rhs> for Bn {
         type Output = Self;
 
         fn $func(self, rhs: $rhs) -> Self::Output {
-            $opr(&self, rhs as u32)
+            $owned_op(self, rhs as u32)
         }
     }
 
-    #[allow(clippy::unnecessary_cast)]
-    impl $ops_assign<$rhs> for Bn {
-        fn $func_assign(&mut self, rhs: $rhs) {
-            *self = $opr(self, rhs as u32);
+        impl $ops_assign<$rhs> for Bn {
+            fn $func_assign(&mut self, rhs: $rhs) {
+                let value = mem::replace(self, Bn::zero());
+                *self = $owned_op(value, rhs as u32);
+            }
         }
-    }
 )*};
-($ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:expr) => {
-    shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $opr, u8, u16, u32, u64, usize);
-    shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $opr, i8, i16, i32, i64, isize);
+($ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $ref_op:expr, $owned_op:expr) => {
+    shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $ref_op, $owned_op, u8, u16, u32, u64, usize);
+    shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $ref_op, $owned_op, i8, i16, i32, i64, isize);
 };
 }
 
-shift_impl!(Shl, shl, ShlAssign, shl_assign, inner_shl);
-shift_impl!(Shr, shr, ShrAssign, shr_assign, inner_shr);
+shift_impl!(Shl, shl, ShlAssign, shl_assign, inner_shl, inner_shl_owned);
+shift_impl!(Shr, shr, ShrAssign, shr_assign, inner_shr, inner_shr_owned);
 ops_impl!(Add, add, AddAssign, add_assign, +, +=);
 ops_impl!(Sub, sub, SubAssign, sub_assign, -, -=);
 ops_impl!(Mul, mul, MulAssign, mul_assign, *, *=);
@@ -777,19 +861,17 @@ ops_impl!(Div, div, DivAssign, div_assign, /, /=);
 ops_impl!(Rem, rem, RemAssign, rem_assign, %, %=);
 
 fn inner_shl(lhs: &Bn, rhs: u32) -> Bn {
-    // Grow precision to accommodate the shift
-    let new_prec = (lhs.value.bits_precision() + rhs)
-        .next_multiple_of(64)
-        .max(64);
-    let v = lhs.value.clone().resize(new_prec).shl(rhs);
-    if bool::from(v.is_zero()) {
-        Bn::zero()
-    } else {
-        Bn {
-            sign: lhs.sign,
-            value: v,
-        }
+    inner_shl_owned(lhs.clone(), rhs)
+}
+
+fn inner_shl_owned(mut lhs: Bn, rhs: u32) -> Bn {
+    if lhs.is_zero() {
+        return lhs;
     }
+    let new_precision = precision_for_bits(lhs.value.bits() + rhs);
+    lhs.value = lhs.value.resize(new_precision);
+    lhs.value.shl_assign(rhs);
+    lhs
 }
 
 /// Idea borrowed from [num-bigint](https://github.com/rust-num/num-bigint/blob/master/src/bigint/shift.rs#L100)
@@ -805,29 +887,34 @@ fn shr_round_down(n: &Bn, shift: u32) -> bool {
 }
 
 fn inner_shr(lhs: &Bn, rhs: u32) -> Bn {
-    let round_down = shr_round_down(lhs, rhs);
-    let value = lhs.value.clone().shr(rhs);
-    let value = if round_down {
-        let one = BoxedUint::one().resize(value.bits_precision().max(64));
-        let val = value.resize(one.bits_precision());
-        Option::from(val.checked_add(&one)).unwrap()
-    } else {
-        value
-    };
-    if bool::from(value.is_zero()) {
+    inner_shr_owned(lhs.clone(), rhs)
+}
+
+fn inner_shr_owned(mut lhs: Bn, rhs: u32) -> Bn {
+    let round_down = shr_round_down(&lhs, rhs);
+    lhs.value.shr_assign(rhs);
+    if round_down {
+        lhs.value += 1u8;
+    }
+    lhs.value = minimize(lhs.value);
+    if bool::from(lhs.value.is_zero()) {
         Bn::zero()
     } else {
-        Bn {
-            sign: lhs.sign,
-            value,
-        }
+        lhs
     }
 }
 
 impl ConstantTimeEq for Bn {
     fn ct_eq(&self, other: &Self) -> Choice {
-        let (lv, rv) = normalize(&self.value, &other.value);
-        self.sign.ct_eq(&other.sign) & lv.ct_eq(&rv)
+        let lhs = self.value.as_words();
+        let rhs = other.value.as_words();
+        let mut difference: Word = 0;
+        for index in 0..lhs.len().max(rhs.len()) {
+            let lhs_word = lhs.get(index).copied().map_or(0, core::convert::identity);
+            let rhs_word = rhs.get(index).copied().map_or(0, core::convert::identity);
+            difference |= lhs_word ^ rhs_word;
+        }
+        self.sign.ct_eq(&other.sign) & difference.ct_eq(&0)
     }
 }
 
@@ -841,18 +928,11 @@ impl Serialize for Bn {
             bytes.push(0);
         }
         if s.is_human_readable() {
-            let hex_str = hex::encode(&bytes);
-            if self.sign.is_negative() {
-                alloc::format!("-{}", hex_str).serialize(s)
-            } else {
-                hex_str.serialize(s)
-            }
+            encode_signed_hex(self.sign.is_negative(), &bytes).serialize(s)
         } else {
             let is_neg = self.sign.is_negative();
-            let mut out = alloc::vec::Vec::with_capacity(1 + bytes.len());
-            out.push(if is_neg { 1u8 } else { 0u8 });
-            out.extend_from_slice(&bytes);
-            s.serialize_bytes(&out)
+            bytes.insert(0, if is_neg { 1u8 } else { 0u8 });
+            s.serialize_bytes(&bytes)
         }
     }
 }
@@ -863,35 +943,38 @@ impl<'de> Deserialize<'de> for Bn {
         D: Deserializer<'de>,
     {
         if d.is_human_readable() {
-            let s = alloc::string::String::deserialize(d)?;
-            let (is_neg, hex_part) = if let Some(stripped) = s.strip_prefix('-') {
-                (true, stripped)
-            } else {
-                (false, s.as_str())
-            };
-            let hex_str = if hex_part.len() % 2 != 0 {
-                alloc::format!("0{}", hex_part)
-            } else {
-                alloc::string::String::from(hex_part)
-            };
-            let bytes = hex::decode(&hex_str).map_err(|e| {
-                de::Error::invalid_value(
-                    de::Unexpected::Str(&s),
-                    &alloc::format!("valid hex: {}", e).as_str(),
-                )
-            })?;
-            let bn = if bytes.is_empty() {
-                Self::zero()
-            } else {
-                Self::from_slice(&bytes)
-            };
-            if bn.is_zero() {
-                Ok(Self::zero())
-            } else if is_neg {
-                Ok(-bn)
-            } else {
-                Ok(bn)
+            struct BnStrVisitor;
+
+            impl<'de> Visitor<'de> for BnStrVisitor {
+                type Value = Bn;
+
+                fn expecting(&self, f: &mut Formatter) -> fmt::Result {
+                    write!(f, "a hex encoded string")
+                }
+
+                fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    let (is_neg, bytes) = decode_signed_hex(s).ok_or_else(|| {
+                        de::Error::invalid_value(de::Unexpected::Str(s), &"valid hex")
+                    })?;
+                    let bn = if bytes.is_empty() {
+                        Bn::zero()
+                    } else {
+                        Bn::from_slice(&bytes)
+                    };
+                    if bn.is_zero() {
+                        Ok(Bn::zero())
+                    } else if is_neg {
+                        Ok(-bn)
+                    } else {
+                        Ok(bn)
+                    }
+                }
             }
+
+            d.deserialize_str(BnStrVisitor)
         } else {
             struct BnBytesVisitor;
 
@@ -958,224 +1041,235 @@ impl Product for Bn {
 }
 
 /// Get a default OS-level cryptographic RNG
-fn default_rng() -> rand_core::UnwrapErr<rand::rngs::SysRng> {
-    rand_core::UnwrapErr(rand::rngs::SysRng)
+fn default_rng() -> crate::Result<rand::rngs::StdRng> {
+    use rand::SeedableRng;
+
+    Ok(rand::rngs::StdRng::try_from_rng(&mut rand::rngs::SysRng)?)
 }
 
 impl Bn {
-    /// Returns `(self ^ exponent) mod n`
-    /// Note that this rounds down
-    /// which makes a difference when given a negative `self` or `n`.
-    /// The result will be in the interval `[0, n)` for `n > 0`
-    pub fn modpow(&self, exponent: &Self, n: &Self) -> Self {
-        assert!(!bool::from(n.value.is_zero()));
-        let prec = self
-            .value
-            .bits_precision()
-            .max(exponent.value.bits_precision())
-            .max(n.value.bits_precision())
-            .max(64);
-        let nv = n.value.clone().resize(prec);
-        let odd_n =
-            Option::from(Odd::new(nv.clone())).expect("modulus must be odd for Montgomery form");
-        let params = BoxedMontyParams::new_vartime(odd_n);
-        let mm = match exponent.sign {
-            Sign::None => return Self::one(),
-            Sign::Minus => match self.invert(n) {
-                None => return Self::zero(),
-                Some(a) => BoxedMontyForm::new(a.value.resize(prec), &params),
-            },
-            Sign::Plus => BoxedMontyForm::new(self.value.clone().resize(prec), &params),
-        };
-
-        let exp_value = exponent.value.clone().resize(prec);
-        let value = mm.pow(&exp_value).retrieve();
-
-        let odd: bool = exponent.value.is_odd().into();
-
-        let (sign, value) = match (self.sign.is_negative() && odd, n.sign.is_negative()) {
-            (true, false) => {
-                let v = Option::from(nv.checked_sub(&value)).unwrap();
-                (Sign::Plus, v)
-            }
-            (_, _) => (Sign::Plus, value),
-        };
-        Self {
-            sign: if bool::from(value.is_zero()) {
-                Sign::None
-            } else {
-                sign
-            },
-            value,
-        }
-    }
-
-    /// Compute (self + rhs) mod n
-    pub fn modadd(&self, rhs: &Self, n: &Self) -> Self {
-        let (sv, rv, nv) = normalize3(&self.value, &rhs.value, &n.value);
-        let nz_nv = Option::from(NonZero::new(nv.clone())).expect("modulus is zero");
-        match (self.sign, rhs.sign) {
-            (_, Sign::None) => {
-                let zero = BoxedUint::zero().resize(nv.bits_precision());
-                let mut bn = Self {
-                    sign: self.sign,
-                    value: sv.add_mod(&zero, &nz_nv),
-                };
-                if bn.sign.is_negative() {
-                    let (bv, nv2) = normalize(&bn.value, &nv);
-                    bn.value = Option::from(bv.checked_add(&nv2)).unwrap();
-                    -bn
-                } else {
-                    bn
-                }
-            }
-            (Sign::None, _) => {
-                let zero = BoxedUint::zero().resize(nv.bits_precision());
-                let mut bn = Self {
-                    sign: rhs.sign,
-                    value: rv.add_mod(&zero, &nz_nv),
-                };
-                if bn.sign.is_negative() {
-                    let (bv, nv2) = normalize(&bn.value, &nv);
-                    bn.value = Option::from(bv.checked_add(&nv2)).unwrap();
-                    -bn
-                } else {
-                    bn
-                }
-            }
-            (Sign::Plus, Sign::Plus) => Self {
-                sign: self.sign,
-                value: sv.add_mod(&rv, &nz_nv),
-            },
-            (Sign::Minus, Sign::Minus) => {
-                let value = sv.add_mod(&rv, &nz_nv);
-                let (v, n2) = normalize(&value, &nv);
-                Self {
-                    sign: Sign::Plus,
-                    value: Option::from(v.checked_add(&n2)).unwrap(),
-                }
-            }
-            (Sign::Plus, Sign::Minus) | (Sign::Minus, Sign::Plus) => {
-                let mut bn = match sv.cmp(&rv) {
-                    Ordering::Less => Self {
-                        sign: rhs.sign,
-                        value: rv.sub_mod(&sv, &nz_nv),
-                    },
-                    Ordering::Greater => Self {
-                        sign: self.sign,
-                        value: sv.sub_mod(&rv, &nz_nv),
-                    },
-                    Ordering::Equal => Self::zero(),
-                };
-                if bn.sign.is_negative() {
-                    let (bv, nv2) = normalize(&bn.value, &nv);
-                    bn.value = Option::from(bv.checked_add(&nv2)).unwrap();
-                    -bn
-                } else {
-                    bn
-                }
-            }
-        }
-    }
-
-    /// Compute (self - rhs) mod n
-    pub fn modsub(&self, rhs: &Self, n: &Self) -> Self {
-        self.modadd(&-rhs, n)
-    }
-
-    /// Compute (self * rhs) mod n
-    pub fn modmul(&self, rhs: &Self, n: &Self) -> Self {
-        let prec = self
-            .value
-            .bits_precision()
-            .max(rhs.value.bits_precision())
-            .max(n.value.bits_precision())
-            .max(64);
-        let nv = n.value.clone().resize(prec);
-        let odd_n =
-            Option::from(Odd::new(nv.clone())).expect("modulus must be odd for Montgomery form");
-        let params = BoxedMontyParams::new_vartime(odd_n);
-        let l = BoxedMontyForm::new(self.value.clone().resize(prec), &params);
-        let r = BoxedMontyForm::new(rhs.value.clone().resize(prec), &params);
-
-        let result = (l * r).retrieve();
-        let sign = if bool::from(result.is_zero()) {
-            Sign::None
-        } else {
-            self.sign * rhs.sign
-        };
-
-        match sign {
-            Sign::None => Self::zero(),
-            Sign::Plus => Self {
-                sign,
-                value: result,
-            },
-            Sign::Minus => {
-                let (r, n2) = normalize(&result, &nv);
-                Self {
-                    sign: Sign::Plus,
-                    value: Option::from(r.checked_add(&n2)).unwrap(),
-                }
-            }
-        }
-    }
-
-    /// Compute (self * 1/rhs) mod n
-    pub fn moddiv(&self, rhs: &Self, n: &Self) -> Self {
-        let prec = rhs
-            .value
-            .bits_precision()
-            .max(n.value.bits_precision())
-            .max(64);
-        let nv = n.value.clone().resize(prec);
-        let odd_n = Option::from(Odd::new(nv)).expect("modulus must be odd for Montgomery form");
-        let params = BoxedMontyParams::new_vartime(odd_n);
-        let r = BoxedMontyForm::new(rhs.value.clone().resize(prec), &params);
-
-        let inv = r.invert();
-
-        if inv.is_none().into() {
-            return Self::zero();
-        }
-        let rhs = Self {
-            sign: rhs.sign,
-            value: inv.unwrap().retrieve(),
-        };
-        self.modmul(&rhs, n)
-    }
-
-    /// Compute -self mod n
-    pub fn modneg(&self, n: &Self) -> Self {
-        let prec = self
-            .value
-            .bits_precision()
-            .max(n.value.bits_precision())
-            .max(64);
-        let nv = n.value.clone().resize(prec);
-        let odd_n = Option::from(Odd::new(nv)).expect("modulus must be odd for Montgomery form");
-        let params = BoxedMontyParams::new_vartime(odd_n);
-        let r = BoxedMontyForm::new(self.value.clone().resize(prec), &params);
-        let value = (-r).retrieve();
-
-        if self.sign.is_zero() || bool::from(value.is_zero()) {
+    fn from_positive(value: BoxedUint) -> Self {
+        if bool::from(value.is_zero()) {
             Self::zero()
         } else {
             Self {
-                sign: -self.sign,
+                sign: Sign::Plus,
+                value: minimize(value),
+            }
+        }
+    }
+
+    fn from_residue(value: BoxedUint) -> Self {
+        if bool::from(value.is_zero()) {
+            Self {
+                sign: Sign::None,
+                value,
+            }
+        } else {
+            Self {
+                sign: Sign::Plus,
                 value,
             }
         }
     }
 
+    fn modulus(n: &Self) -> Option<&NonZero<BoxedUint>> {
+        n.value.as_nz_vartime()
+    }
+
+    fn residue(&self, modulus: &NonZero<BoxedUint>) -> BoxedUint {
+        Self::reduce_residue(self.sign, self.value.clone(), modulus)
+    }
+
+    fn take_residue(&mut self, modulus: &NonZero<BoxedUint>) -> BoxedUint {
+        let sign = mem::replace(&mut self.sign, Sign::None);
+        let value = mem::replace(&mut self.value, BoxedUint::zero());
+        Self::reduce_residue(sign, value, modulus)
+    }
+
+    fn reduce_residue(sign: Sign, value: BoxedUint, modulus: &NonZero<BoxedUint>) -> BoxedUint {
+        let modulus_value = modulus.as_ref();
+        let precision = modulus_value.bits_precision();
+        let remainder = match cmp_magnitude(&value, modulus_value) {
+            Ordering::Less => value.resize(precision),
+            Ordering::Equal => BoxedUint::zero().resize(precision),
+            Ordering::Greater => value.rem_vartime(modulus),
+        };
+
+        if sign.is_negative() && !bool::from(remainder.is_zero()) {
+            sub_magnitudes_fixed(modulus_value, &remainder)
+        } else {
+            remainder
+        }
+    }
+
+    /// Returns `(self ^ exponent) mod n`
+    /// Note that this rounds down
+    /// which makes a difference when given a negative `self` or `n`.
+    /// The result will be in the interval `[0, n)` for `n > 0`
+    pub fn modpow(&self, exponent: &Self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+
+        if modulus.as_ref().bits() == 1 {
+            return Self::zero();
+        }
+
+        let mut base = self.residue(modulus);
+        if exponent.sign.is_negative() {
+            let inverse = base.invert_mod(modulus);
+            if bool::from(inverse.is_none()) {
+                return Self::zero();
+            }
+            let Some(inverse) = Option::from(inverse) else {
+                return Self::zero();
+            };
+            base = inverse;
+        }
+
+        if exponent.is_zero() {
+            return Self::from_residue(BoxedUint::one().resize(modulus.as_ref().bits_precision()));
+        }
+
+        let value = if bool::from(modulus.as_ref().is_odd()) {
+            let Some(odd_modulus) = Option::from(Odd::new(modulus.as_ref().clone())) else {
+                return Self::zero();
+            };
+            let params = BoxedMontyParams::new_vartime(odd_modulus);
+            BoxedMontyForm::new(base, &params)
+                .pow(&exponent.value)
+                .retrieve()
+        } else {
+            let mut result = BoxedUint::one().resize(modulus.as_ref().bits_precision());
+            let exponent_bits = exponent.value.bits_vartime();
+            for bit in 0..exponent_bits {
+                if exponent.value.bit_vartime(bit) {
+                    result = result.mul_mod(&base, modulus);
+                }
+                if bit + 1 < exponent_bits {
+                    base = base.square_mod(modulus);
+                }
+            }
+            result
+        };
+
+        Self::from_residue(value)
+    }
+
+    /// Compute (self + rhs) mod n
+    pub fn modadd(&self, rhs: &Self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        let lhs = self.residue(modulus);
+        let rhs = rhs.residue(modulus);
+        Self::from_residue(lhs.add_mod(&rhs, modulus))
+    }
+
+    pub(crate) fn modadd_assign(&mut self, rhs: &Self, n: &Self) {
+        let Some(modulus) = Self::modulus(n) else {
+            *self = Self::zero();
+            return;
+        };
+        let lhs = self.take_residue(modulus);
+        let rhs = rhs.residue(modulus);
+        *self = Self::from_residue(lhs.add_mod(&rhs, modulus));
+    }
+
+    /// Compute (self - rhs) mod n
+    pub fn modsub(&self, rhs: &Self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        let lhs = self.residue(modulus);
+        let rhs = rhs.residue(modulus);
+        Self::from_residue(lhs.sub_mod(&rhs, modulus))
+    }
+
+    pub(crate) fn modsub_assign(&mut self, rhs: &Self, n: &Self) {
+        let Some(modulus) = Self::modulus(n) else {
+            *self = Self::zero();
+            return;
+        };
+        let lhs = self.take_residue(modulus);
+        let rhs = rhs.residue(modulus);
+        *self = Self::from_residue(lhs.sub_mod(&rhs, modulus));
+    }
+
+    /// Compute (self * rhs) mod n
+    pub fn modmul(&self, rhs: &Self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        let lhs = self.residue(modulus);
+        let rhs = rhs.residue(modulus);
+        Self::from_residue(lhs.mul_mod(&rhs, modulus))
+    }
+
+    pub(crate) fn modmul_assign(&mut self, rhs: &Self, n: &Self) {
+        let Some(modulus) = Self::modulus(n) else {
+            *self = Self::zero();
+            return;
+        };
+        let lhs = self.take_residue(modulus);
+        let rhs = rhs.residue(modulus);
+        *self = Self::from_residue(lhs.mul_mod(&rhs, modulus));
+    }
+
+    /// Compute (self * 1/rhs) mod n
+    pub fn moddiv(&self, rhs: &Self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        let inverse = rhs.residue(modulus).invert_mod(modulus);
+        if bool::from(inverse.is_none()) {
+            return Self::zero();
+        }
+        let lhs = self.residue(modulus);
+        let Some(inverse) = Option::from(inverse) else {
+            return Self::zero();
+        };
+        Self::from_residue(lhs.mul_mod(&inverse, modulus))
+    }
+
+    pub(crate) fn moddiv_assign(&mut self, rhs: &Self, n: &Self) {
+        let Some(modulus) = Self::modulus(n) else {
+            *self = Self::zero();
+            return;
+        };
+        let inverse = rhs.residue(modulus).invert_mod(modulus);
+        if bool::from(inverse.is_none()) {
+            *self = Self::zero();
+            return;
+        }
+        let lhs = self.take_residue(modulus);
+        let Some(inverse) = Option::from(inverse) else {
+            *self = Self::zero();
+            return;
+        };
+        *self = Self::from_residue(lhs.mul_mod(&inverse, modulus));
+    }
+
+    /// Compute -self mod n
+    pub fn modneg(&self, n: &Self) -> Self {
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        let value = self.residue(modulus);
+        if bool::from(value.is_zero()) {
+            Self::from_residue(value)
+        } else {
+            Self::from_residue(sub_magnitudes_fixed(modulus.as_ref(), &value))
+        }
+    }
+
     /// Compute self mod n
     pub fn nmod(&self, n: &Self) -> Self {
-        let nn = get_mod(n);
-        let mut out = self.clone() % nn;
-        if out < Self::zero() {
-            out += n;
-        }
-        out
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        Self::from_residue(self.residue(modulus))
     }
 
     /// Computes the multiplicative inverse of this element, failing if the element is zero.
@@ -1183,14 +1277,10 @@ impl Bn {
         if self.is_zero() || n.is_zero() || n.is_one() {
             return None;
         }
-        let (sv, nv) = normalize(&self.value, &n.value);
-        let nz_n = Option::from(NonZero::new(nv)).expect("modulus is zero");
-        let result = sv.invert_mod(&nz_n);
-        if result.is_some().into() {
-            Some(Self {
-                sign: self.sign,
-                value: result.unwrap(),
-            })
+        let modulus = Self::modulus(n)?;
+        let result = self.residue(modulus).invert_mod(modulus);
+        if bool::from(result.is_some()) {
+            Option::from(result).map(Self::from_residue)
         } else {
             None
         }
@@ -1199,6 +1289,11 @@ impl Bn {
     /// self == 0
     pub fn is_zero(&self) -> bool {
         self.sign.is_zero() || bool::from(self.value.is_zero())
+    }
+
+    /// Return whether this value is negative.
+    pub fn is_negative(&self) -> bool {
+        self.sign.is_negative()
     }
 
     /// self == 1
@@ -1213,34 +1308,7 @@ impl Bn {
 
     /// Compute the greatest common divisor
     pub fn gcd(&self, other: &Self) -> Self {
-        // borrowed from num-bigint/src/biguint.rs
-
-        // Stein's algorithm
-        if self.is_zero() {
-            return other.clone();
-        }
-        if other.is_zero() {
-            return self.clone();
-        }
-        let mut m = self.clone();
-        let mut n = other.clone();
-
-        // find common factors of 2
-        let shift = cmp::min(n.value.trailing_zeros(), m.value.trailing_zeros());
-
-        // divide m and n by 2 until odd
-        // m inside loop
-        n >>= n.value.trailing_zeros() as usize;
-
-        while !m.is_zero() {
-            m >>= m.value.trailing_zeros() as usize;
-            if n > m {
-                mem::swap(&mut n, &mut m)
-            }
-            m -= &n;
-        }
-
-        n << shift as usize
+        Self::from_positive(self.value.gcd_vartime(&other.value))
     }
 
     /// Compute the least common multiple
@@ -1248,18 +1316,23 @@ impl Bn {
         if self.is_zero() && other.is_zero() {
             Self::zero()
         } else {
-            self / self.gcd(other) * other
+            let value = self / self.gcd(other) * other;
+            if value.sign.is_negative() {
+                -value
+            } else {
+                value
+            }
         }
     }
 
     /// Generate a random value less than `n`
-    pub fn random(n: &Self) -> Self {
-        Self::from_rng(n, &mut default_rng())
+    pub fn random(n: &Self) -> crate::Result<Self> {
+        Ok(Self::from_rng(n, &mut default_rng()?))
     }
 
     /// Generate a random value with `n` bits
-    pub fn random_bits(n: u32) -> Self {
-        Self::from_rng_bits(n, &mut default_rng())
+    pub fn random_bits(n: u32) -> crate::Result<Self> {
+        Ok(Self::from_rng_bits(n, &mut default_rng()?))
     }
 
     /// Generate a random value less than `n` using the specific random number generator
@@ -1267,25 +1340,28 @@ impl Bn {
         if n.is_zero() {
             return Self::zero();
         }
-        let nz_n = Option::from(NonZero::new(n.value.clone())).expect("divisor is zero");
-        Self {
-            sign: Sign::Plus,
-            value: BoxedUint::random_mod_vartime(rng, &nz_n),
-        }
+        let Some(modulus) = Self::modulus(n) else {
+            return Self::zero();
+        };
+        Self::from_positive(BoxedUint::random_mod_vartime(rng, modulus))
     }
 
     /// Generate a random value between [lower, upper)
-    pub fn random_range(lower: &Self, upper: &Self) -> Self {
-        Self::random_range_with_rng(lower, upper, &mut default_rng())
+    pub fn random_range(lower: &Self, upper: &Self) -> crate::Result<Self> {
+        Self::random_range_with_rng(lower, upper, &mut default_rng()?)
     }
 
     /// Generate a random value between [lower, upper) using the specific random number generator
-    pub fn random_range_with_rng(lower: &Self, upper: &Self, rng: &mut impl CryptoRng) -> Self {
+    pub fn random_range_with_rng(
+        lower: &Self,
+        upper: &Self,
+        rng: &mut impl CryptoRng,
+    ) -> crate::Result<Self> {
         if lower >= upper {
-            panic!("lower bound is greater than or equal to upper bound");
+            return Err(crate::Error::InvalidRange);
         }
         let range = upper - lower;
-        lower + Self::from_rng(&range, rng)
+        Ok(lower + Self::from_rng(&range, rng))
     }
 
     /// Generate a random value with `n` bits using the specific random number generator
@@ -1293,11 +1369,9 @@ impl Bn {
         if n < 1 {
             return Self::zero();
         }
-        let mut m: BoxedUint = RandomBits::try_random_bits(rng, n).expect("random bits failed");
+        let mut m: BoxedUint = RandomBits::random_bits(rng, n);
         // Set the high bit to ensure the number is exactly n bits
-        let prec = m.bits_precision();
-        let high_bit = BoxedUint::one().resize(prec).shl(n - 1);
-        m = m.bitor(&high_bit);
+        m.set_bit_vartime(n - 1, true);
         Self {
             sign: Sign::Plus,
             value: m,
@@ -1318,14 +1392,9 @@ impl Bn {
         B: AsRef<[u8]>,
     {
         let b = b.as_ref();
-        let bits_precision = ((b.len() * 8) as u32).next_multiple_of(64).max(64);
-        let pad_len = (bits_precision / 8) as usize;
-        let mut padded = alloc::vec![0u8; pad_len];
-        if !b.is_empty() {
-            let start = pad_len - b.len();
-            padded[start..].copy_from_slice(b);
-        }
-        let value = BoxedUint::from_be_slice(&padded, bits_precision).expect("invalid byte length");
+        let first_nonzero = b.iter().position(|byte| *byte != 0).unwrap_or(b.len());
+        let b = &b[first_nonzero..];
+        let value = minimize(BoxedUint::from_be_slice_vartime(b));
         if bool::from(value.is_zero()) {
             Self {
                 sign: Sign::None,
@@ -1344,81 +1413,116 @@ impl Bn {
         if bool::from(self.value.is_zero()) {
             return alloc::vec::Vec::new();
         }
-        let bytes = self.value.to_be_bytes();
+        let mut bytes = self.value.to_be_bytes().into_vec();
         let start = bytes.iter().position(|&b| b != 0).unwrap_or(0);
-        bytes[start..].to_vec()
+        if start > 0 {
+            let len = bytes.len();
+            bytes.copy_within(start.., 0);
+            bytes.truncate(len - start);
+        }
+        bytes
     }
 
     /// Convert this big number to a big-endian byte sequence and store it in `buffer`.
     /// The sign is not included
-    pub fn copy_bytes_into_buffer(&self, buffer: &mut [u8]) {
-        let bytes = self.value.to_be_bytes();
-        buffer.copy_from_slice(&bytes)
+    pub fn copy_bytes_into_buffer(&self, buffer: &mut [u8]) -> crate::Result<()> {
+        let expected = self.bit_length().div_ceil(8);
+        if buffer.len() != expected {
+            return Err(crate::Error::BufferLength {
+                expected,
+                actual: buffer.len(),
+            });
+        }
+        let len = buffer.len();
+        buffer.fill(0);
+        for (word_index, word) in self.value.as_words().iter().enumerate() {
+            let word_bytes = word.to_le_bytes();
+            for (byte_index, byte) in word_bytes.into_iter().enumerate() {
+                let from_end = word_index * word_bytes.len() + byte_index;
+                if from_end < len {
+                    buffer[len - from_end - 1] = byte;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Compute the extended euclid algorithm and return the Bézout coefficients and GCD
-    #[allow(clippy::many_single_char_names)]
-    pub fn extended_gcd(&self, other: &Self) -> GcdResult {
-        let mut s = (Self::zero(), Self::one());
-        let mut t = (Self::one(), Self::zero());
-        let mut r = (other.clone(), self.clone());
+    pub fn extended_gcd(&self, other: &Self) -> GcdResult<Self> {
+        let mut self_coefficients = (Self::zero(), Self::one());
+        let mut other_coefficients = (Self::one(), Self::zero());
+        let mut remainders = (other.clone(), self.clone());
 
-        while !r.0.is_zero() {
-            let q = r.1.clone() / r.0.clone();
-            let f = |mut r: (Self, Self)| {
-                mem::swap(&mut r.0, &mut r.1);
-                r.0 -= q.clone() * r.1.clone();
-                r
-            };
-            r = f(r);
-            s = f(s);
-            t = f(t);
+        while !remainders.0.is_zero() {
+            let quotient = &remainders.1 / &remainders.0;
+
+            mem::swap(&mut remainders.0, &mut remainders.1);
+            remainders.0 -= &quotient * &remainders.1;
+
+            mem::swap(&mut self_coefficients.0, &mut self_coefficients.1);
+            self_coefficients.0 -= &quotient * &self_coefficients.1;
+
+            mem::swap(&mut other_coefficients.0, &mut other_coefficients.1);
+            other_coefficients.0 -= &quotient * &other_coefficients.1;
         }
 
-        if r.1 >= Self::zero() {
+        if remainders.1 >= Self::zero() {
             GcdResult {
-                gcd: r.1,
-                x: s.1,
-                y: t.1,
+                gcd: remainders.1,
+                x: self_coefficients.1,
+                y: other_coefficients.1,
             }
         } else {
             GcdResult {
-                gcd: Self::zero() - r.1,
-                x: Self::zero() - s.1,
-                y: Self::zero() - t.1,
+                gcd: Self::zero() - remainders.1,
+                x: Self::zero() - self_coefficients.1,
+                y: Self::zero() - other_coefficients.1,
             }
         }
     }
 
     /// Generate a safe prime with `size` bits
-    pub fn safe_prime(size: usize) -> Self {
-        Self::safe_prime_from_rng(size, &mut default_rng())
+    pub fn safe_prime(size: usize) -> crate::Result<Self> {
+        Self::safe_prime_from_rng(size, &mut default_rng()?)
     }
 
     /// Generate a safe prime with `size` bits with a user-provided rng
-    pub fn safe_prime_from_rng(size: usize, rng: &mut impl CryptoRng) -> Self {
-        Self {
+    pub fn safe_prime_from_rng(size: usize, rng: &mut impl CryptoRng) -> crate::Result<Self> {
+        crate::error::validate_bit_length(size, 3, u32::MAX as usize)?;
+        Ok(Self {
             sign: Sign::Plus,
-            value: crypto_primes::random_prime(rng, crypto_primes::Flavor::Safe, size as u32),
-        }
+            value: minimize(crypto_primes::random_prime(
+                rng,
+                crypto_primes::Flavor::Safe,
+                size as u32,
+            )),
+        })
     }
 
     /// Generate a prime with `size` bits
-    pub fn prime(size: usize) -> Self {
-        Self::prime_from_rng(size, &mut default_rng())
+    pub fn prime(size: usize) -> crate::Result<Self> {
+        Self::prime_from_rng(size, &mut default_rng()?)
     }
 
     /// Generate a prime with `size` bits with a user-provided rng
-    pub fn prime_from_rng(size: usize, rng: &mut impl CryptoRng) -> Self {
-        Self {
+    pub fn prime_from_rng(size: usize, rng: &mut impl CryptoRng) -> crate::Result<Self> {
+        crate::error::validate_bit_length(size, 2, u32::MAX as usize)?;
+        Ok(Self {
             sign: Sign::Plus,
-            value: crypto_primes::random_prime(rng, crypto_primes::Flavor::Any, size as u32),
-        }
+            value: minimize(crypto_primes::random_prime(
+                rng,
+                crypto_primes::Flavor::Any,
+                size as u32,
+            )),
+        })
     }
 
     /// True if a prime number
-    pub fn is_prime(&self) -> bool {
-        crypto_primes::is_prime(crypto_primes::Flavor::Any, &self.value)
+    pub fn is_prime(&self) -> crate::Result<bool> {
+        Ok(crypto_primes::is_prime(
+            crypto_primes::Flavor::Any,
+            &self.value,
+        ))
     }
 
     /// Return zero
@@ -1436,37 +1540,34 @@ impl Bn {
 
     /// Simultaneous integer division and modulus
     pub fn div_rem(&self, other: &Self) -> (Self, Self) {
-        let (sv, ov) = normalize(&self.value, &other.value);
-        let nz = Option::from(NonZero::new(ov)).expect("divisor is zero");
-        let (d, r) = sv.div_rem(&nz);
+        let Some(divisor) = Option::from(NonZero::new(other.value.clone())) else {
+            return (Self::zero(), self.clone());
+        };
+        let (d, r) = self.value.div_rem_vartime(&divisor);
+        let d = minimize(d);
+        let r = minimize(r);
+        let quotient_sign = if bool::from(d.is_zero()) {
+            Sign::None
+        } else if other.sign == Sign::Minus {
+            -self.sign
+        } else {
+            self.sign
+        };
         let rem_sign = if bool::from(r.is_zero()) {
             Sign::None
         } else {
-            Sign::Plus
+            self.sign
         };
-        if other.sign == Sign::Minus {
-            (
-                Self {
-                    sign: -self.sign,
-                    value: d,
-                },
-                Self {
-                    sign: rem_sign,
-                    value: r,
-                },
-            )
-        } else {
-            (
-                Self {
-                    sign: self.sign,
-                    value: d,
-                },
-                Self {
-                    sign: rem_sign,
-                    value: r,
-                },
-            )
-        }
+        (
+            Self {
+                sign: quotient_sign,
+                value: d,
+            },
+            Self {
+                sign: rem_sign,
+                value: r,
+            },
+        )
     }
 }
 
@@ -1476,20 +1577,14 @@ mod tests {
 
     #[test]
     fn basic_ops() {
-        let (_, v1) =
-            multibase::decode("9595374401003766034096130243798882341754528442149").unwrap();
-        let (_, v2) =
-            multibase::decode("9365375409332725729550921208179070754913983243889").unwrap();
-        let (_, v3) =
-            multibase::decode("9960749810336491763647051451977953096668511686038").unwrap();
-        let (_, v4) =
-            multibase::decode("9229998991671040304545209035619811586840545198260").unwrap();
-        let (_, v5) = multibase::decode("9217535165472977407178102302905245480306183692659917226463581384024497196271511427656856694277461").unwrap();
-        let bn1 = Bn::from_slice(v1.as_slice());
-        let bn2 = Bn::from_slice(v2.as_slice());
-        let bn3 = Bn::from_slice(v3.as_slice());
-        let bn4 = Bn::from_slice(v4.as_slice());
-        let bn5 = Bn::from_slice(v5.as_slice());
+        let from_hex = |value| Bn::from_slice(crate::decode_hex(value).unwrap());
+        let bn1 = from_hex("684982f082a4b2953bd04e1761dea837fec1a725");
+        let bn2 = from_hex("400000000000000000000000000000000001a671");
+        let bn3 = from_hex("a84982f082a4b2953bd04e1761dea837fec34d96");
+        let bn4 = from_hex("284982f082a4b2953bd04e1761dea837fec000b4");
+        let bn5 = from_hex(
+            "1a1260bc20a92ca54ef41385d877aa0dffb115e0764b43852914d478c7ad03a73c948eaaad01c555",
+        );
         assert_eq!(&bn1 + &bn2, bn3);
         assert_eq!(&bn1 - &bn2, bn4);
         assert_eq!(&bn2 - &bn1, -bn4);
@@ -1500,15 +1595,62 @@ mod tests {
 
     #[test]
     fn primes() {
-        let p1 = Bn::prime_from_rng(256, &mut default_rng());
-        assert!(p1.is_prime());
+        let p1 = Bn::prime_from_rng(256, &mut default_rng().unwrap()).unwrap();
+        assert!(p1.is_prime().unwrap());
     }
 
     #[test]
     fn bytes() {
-        let p1 = Bn::prime_from_rng(256, &mut default_rng());
+        let p1 = Bn::prime_from_rng(256, &mut default_rng().unwrap()).unwrap();
         let bytes = p1.to_bytes();
         let p2 = Bn::from_slice(&bytes);
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn dynamic_precision() {
+        let wide = Bn::from(u128::MAX);
+        assert_eq!(wide.to_bytes(), u128::MAX.to_be_bytes());
+
+        let carry = Bn::from(u64::MAX) + Bn::one();
+        assert_eq!(carry, Bn::from(1u128 << 64));
+
+        let product = Bn::from(u64::MAX) * Bn::from(u64::MAX);
+        assert_eq!(product, Bn::from((u64::MAX as u128).pow(2)));
+
+        let shifted = Bn::one() << 130usize;
+        assert_eq!(shifted.bit_length(), 131);
+        assert_eq!(shifted.to_bytes().len(), 17);
+
+        let minimum = Bn::from(i128::MIN);
+        assert_eq!(minimum, -Bn::from(1u128 << 127));
+
+        let modulus = (Bn::one() << 127usize) + Bn::one();
+        let fixed_width = Bn::from(5u8).nmod(&modulus);
+        assert_eq!(fixed_width, Bn::from(5u8));
+        assert_eq!(&fixed_width + Bn::one(), Bn::from(6u8));
+        assert_eq!(&fixed_width - Bn::one(), Bn::from(4u8));
+
+        let mut bytes = [0u8; 1];
+        Bn::one().copy_bytes_into_buffer(&mut bytes).unwrap();
+        assert_eq!(bytes, [1]);
+    }
+
+    #[test]
+    fn modular_arithmetic_with_signed_values_and_even_modulus() {
+        let n = Bn::from(5);
+        assert_eq!(Bn::from(3), Bn::from(-3).modadd(&Bn::from(-4), &n));
+        assert_eq!(Bn::from(3), Bn::from(-3).modmul(&Bn::from(4), &n));
+        assert_eq!(Bn::from(3), Bn::from(-3).modneg(&n));
+        assert_eq!(Bn::from(2), Bn::from(-3).nmod(&-n));
+        assert_eq!(Bn::from(-1), Bn::from(-6) % Bn::from(5));
+
+        let even_modulus = Bn::from(6);
+        assert_eq!(
+            Bn::from(4),
+            Bn::from(-2).modpow(&Bn::from(3), &even_modulus)
+        );
+        assert_eq!(Bn::from(7), Bn::from(-3).invert(&Bn::from(11)).unwrap());
     }
 }

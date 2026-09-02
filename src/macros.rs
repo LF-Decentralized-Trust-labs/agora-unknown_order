@@ -4,12 +4,12 @@
 */
 #[cfg(any(feature = "rust", feature = "gmp"))]
 macro_rules! binops_impl {
-    ($ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:tt, $opr_assign:tt) => {
+    ($ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:tt, $opr_assign:tt, $ref_op:expr) => {
         impl<'a, 'b> $ops<&'b Bn> for &'a Bn {
             type Output = Bn;
 
             fn $func(self, rhs: &'b Self::Output) -> Self::Output {
-                Bn(self.0.clone() $opr &rhs.0)
+                Bn($ref_op(&self.0, &rhs.0))
             }
         }
 
@@ -20,6 +20,19 @@ macro_rules! binops_impl {
         }
 
         ops_impl!($ops, $func, $ops_assign, $func_assign, $opr, $opr_assign);
+    };
+}
+
+#[cfg(any(feature = "gmp", feature = "rust"))]
+macro_rules! get_mod_impl {
+    () => {
+        fn get_mod(n: &Bn) -> alloc::borrow::Cow<'_, Bn> {
+            if n.is_negative() {
+                alloc::borrow::Cow::Owned(-n)
+            } else {
+                alloc::borrow::Cow::Borrowed(n)
+            }
+        }
     };
 }
 
@@ -43,7 +56,7 @@ macro_rules! ops_impl {
 
         impl $ops_assign<$rhs> for Bn {
             fn $func_assign(&mut self, rhs: $rhs) {
-                *self = &*self $opr &Bn::from(rhs);
+                *self $opr_assign Bn::from(rhs);
             }
         }
     )*};
@@ -51,8 +64,9 @@ macro_rules! ops_impl {
         impl<'b> $ops<&'b Bn> for Bn {
             type Output = Bn;
 
-            fn $func(self, rhs: &'b Self::Output) -> Self::Output {
-                &self $opr rhs
+            fn $func(mut self, rhs: &'b Self::Output) -> Self::Output {
+                self $opr_assign rhs;
+                self
             }
         }
 
@@ -67,14 +81,15 @@ macro_rules! ops_impl {
         impl $ops for Bn {
             type Output = Bn;
 
-            fn $func(self, rhs: Self::Output) -> Self::Output {
-                &self $opr &rhs
+            fn $func(mut self, rhs: Self::Output) -> Self::Output {
+                self $opr_assign &rhs;
+                self
             }
         }
 
         impl $ops_assign for Bn {
             fn $func_assign(&mut self, rhs: Bn) {
-                *self = &*self $opr &rhs;
+                *self $opr_assign &rhs;
             }
         }
 
@@ -84,12 +99,12 @@ macro_rules! ops_impl {
 }
 
 macro_rules! neg_impl {
-    ($ops:expr) => {
+    ($ref_op:expr, $owned_op:expr) => {
         impl<'a> Neg for &'a Bn {
             type Output = Bn;
 
             fn neg(self) -> Self::Output {
-                $ops(&self.0)
+                $ref_op(&self.0)
             }
         }
 
@@ -97,15 +112,37 @@ macro_rules! neg_impl {
             type Output = Bn;
 
             fn neg(self) -> Self::Output {
-                $ops(&self.0)
+                $owned_op(self.0)
             }
         }
     };
 }
 
 macro_rules! shift_impl {
+    (@owned $ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $ref_op:expr, $owned_op:expr, $($rhs:ty),+) => {$(
+        impl<'a> $ops<$rhs> for &'a Bn {
+            type Output = Bn;
+
+            fn $func(self, rhs: $rhs) -> Self::Output {
+                $ref_op(&self.0, rhs)
+            }
+        }
+
+        impl $ops<$rhs> for Bn {
+            type Output = Bn;
+
+            fn $func(self, rhs: $rhs) -> Self::Output {
+                $owned_op(self.0, rhs)
+            }
+        }
+
+        impl $ops_assign<$rhs> for Bn {
+            fn $func_assign(&mut self, rhs: $rhs) {
+                self.0 = $owned_op(core::mem::take(&mut self.0), rhs).0;
+            }
+        }
+    )*};
     (@ref $ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $opr:expr, $($rhs:ty),+) => {$(
-        #[allow(clippy::unnecessary_cast)]
         impl<'a> $ops<$rhs> for &'a Bn {
             type Output = Bn;
 
@@ -114,7 +151,6 @@ macro_rules! shift_impl {
             }
         }
 
-        #[allow(clippy::unnecessary_cast)]
         impl $ops<$rhs> for Bn {
             type Output = Bn;
 
@@ -123,7 +159,6 @@ macro_rules! shift_impl {
             }
         }
 
-        #[allow(clippy::unnecessary_cast)]
         impl $ops_assign<$rhs> for Bn {
             fn $func_assign(&mut self, rhs: $rhs) {
                 let t = $opr(&self.0, rhs);
@@ -135,10 +170,14 @@ macro_rules! shift_impl {
         shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $opr, u8, u16, u32, u64, usize);
         shift_impl!(@ref $ops, $func, $ops_assign, $func_assign, $opr, i8, i16, i32, i64, isize);
     };
+    ($ops:ident, $func:ident, $ops_assign:ident, $func_assign:ident, $ref_op:expr, $owned_op:expr) => {
+        shift_impl!(@owned $ops, $func, $ops_assign, $func_assign, $ref_op, $owned_op, u8, u16, u32, u64, usize);
+        shift_impl!(@owned $ops, $func, $ops_assign, $func_assign, $ref_op, $owned_op, i8, i16, i32, i64, isize);
+    };
 }
 
 macro_rules! display_impl {
-    () => {
+    ($radix:ident) => {
         impl Display for Bn {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(f, "{}", self.0)
@@ -151,43 +190,58 @@ macro_rules! display_impl {
             }
         }
 
+        radix_impl!($radix);
+    };
+}
+
+macro_rules! radix_impl {
+    (native) => {
         impl fmt::Binary for Bn {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let bytes = self.to_bytes();
-                for b in &bytes {
-                    write!(f, "{:b}", b)?;
-                }
-                Ok(())
+                fmt::Binary::fmt(&self.0, f)
             }
         }
 
         impl fmt::Octal for Bn {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let bytes = self.to_bytes();
-                for b in &bytes {
-                    write!(f, "{:o}", b)?;
-                }
-                Ok(())
+                fmt::Octal::fmt(&self.0, f)
             }
         }
 
         impl fmt::LowerHex for Bn {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let bytes = self.to_bytes();
-                for b in &bytes {
-                    write!(f, "{:x}", b)?;
-                }
-                Ok(())
+                fmt::LowerHex::fmt(&self.0, f)
             }
         }
 
         impl fmt::UpperHex for Bn {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let bytes = self.to_bytes();
-                for b in &bytes {
-                    write!(f, "{:X}", b)?;
-                }
-                Ok(())
+                fmt::UpperHex::fmt(&self.0, f)
+            }
+        }
+    };
+    (bytes) => {
+        impl fmt::Binary for Bn {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                crate::fmt_bytes_radix(f, self.is_negative(), &self.to_bytes(), 2, false)
+            }
+        }
+
+        impl fmt::Octal for Bn {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                crate::fmt_bytes_radix(f, self.is_negative(), &self.to_bytes(), 8, false)
+            }
+        }
+
+        impl fmt::LowerHex for Bn {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                crate::fmt_bytes_radix(f, self.is_negative(), &self.to_bytes(), 16, false)
+            }
+        }
+
+        impl fmt::UpperHex for Bn {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                crate::fmt_bytes_radix(f, self.is_negative(), &self.to_bytes(), 16, true)
             }
         }
     };
@@ -234,19 +288,12 @@ macro_rules! serdes_impl {
                 if bytes.is_empty() {
                     bytes.push(0);
                 }
+                let is_negative = self.is_negative();
                 if serializer.is_human_readable() {
-                    let hex_str = hex::encode(&bytes);
-                    if *self < Bn::zero() {
-                        serializer.serialize_str(&alloc::format!("-{}", hex_str))
-                    } else {
-                        serializer.serialize_str(&hex_str)
-                    }
+                    serializer.serialize_str(&crate::encode_signed_hex(is_negative, &bytes))
                 } else {
-                    let is_neg = *self < Bn::zero();
-                    let mut out = alloc::vec::Vec::with_capacity(1 + bytes.len());
-                    out.push(if is_neg { 1u8 } else { 0u8 });
-                    out.extend_from_slice(&bytes);
-                    serializer.serialize_bytes(&out)
+                    bytes.insert(0, if is_negative { 1u8 } else { 0u8 });
+                    serializer.serialize_bytes(&bytes)
                 }
             }
         }
@@ -270,20 +317,10 @@ macro_rules! serdes_impl {
                     where
                         E: serde::de::Error,
                     {
-                        let (is_neg, hex_part) = if let Some(stripped) = s.strip_prefix('-') {
-                            (true, stripped)
-                        } else {
-                            (false, s)
-                        };
-                        let hex_str = if hex_part.len() % 2 != 0 {
-                            alloc::format!("0{}", hex_part)
-                        } else {
-                            alloc::string::String::from(hex_part)
-                        };
-                        let bytes = hex::decode(&hex_str).map_err(|e| {
+                        let (is_neg, bytes) = crate::decode_signed_hex(s).ok_or_else(|| {
                             serde::de::Error::invalid_value(
                                 serde::de::Unexpected::Str(s),
-                                &alloc::format!("valid hex: {}", e).as_str(),
+                                &"valid hex",
                             )
                         })?;
                         let bn = if bytes.is_empty() {
@@ -399,11 +436,7 @@ macro_rules! wasm_slice_impl {
             type Abi = wasm_bindgen::convert::WasmSlice;
 
             fn into_abi(self) -> Self::Abi {
-                let a = self.to_bytes();
-                Self::Abi {
-                    ptr: a.as_ptr().into_abi(),
-                    len: a.len() as u32,
-                }
+                wasm_bindgen::convert::IntoWasmAbi::into_abi(self.to_bytes())
             }
         }
 
@@ -412,22 +445,24 @@ macro_rules! wasm_slice_impl {
 
             #[inline]
             unsafe fn from_abi(js: Self::Abi) -> Self {
-                let ptr = <*mut u8>::from_abi(js.ptr);
-                let len = js.len as usize;
-                let r = core::slice::from_raw_parts(ptr, len);
-                $name::from_slice(&r)
+                // SAFETY: `js` is provided by wasm-bindgen under the `FromWasmAbi` contract and
+                // represents an owned `Vec<u8>` allocation with matching pointer and length.
+                let bytes = unsafe {
+                    <alloc::vec::Vec<u8> as wasm_bindgen::convert::FromWasmAbi>::from_abi(js)
+                };
+                $name::from_slice(bytes)
             }
         }
 
         impl wasm_bindgen::convert::OptionIntoWasmAbi for $name {
             fn none() -> wasm_bindgen::convert::WasmSlice {
-                wasm_bindgen::convert::WasmSlice { ptr: 0, len: 0 }
+                <alloc::vec::Vec<u8> as wasm_bindgen::convert::OptionIntoWasmAbi>::none()
             }
         }
 
         impl wasm_bindgen::convert::OptionFromWasmAbi for $name {
             fn is_none(slice: &wasm_bindgen::convert::WasmSlice) -> bool {
-                slice.ptr == 0
+                <alloc::vec::Vec<u8> as wasm_bindgen::convert::OptionFromWasmAbi>::is_none(slice)
             }
         }
 
@@ -435,7 +470,15 @@ macro_rules! wasm_slice_impl {
             type Error = &'static str;
 
             fn try_from(value: wasm_bindgen::JsValue) -> Result<Self, Self::Error> {
-                serde_wasm_bindgen::from_value(value).map_err(|_| "unable to deserialize value")
+                let value = value.as_string().ok_or("unable to deserialize value")?;
+                let (negative, bytes) =
+                    crate::decode_signed_hex(&value).ok_or("unable to deserialize value")?;
+                let number = $name::from_slice(bytes);
+                if negative && !number.is_zero() {
+                    Ok(-number)
+                } else {
+                    Ok(number)
+                }
             }
         }
     };

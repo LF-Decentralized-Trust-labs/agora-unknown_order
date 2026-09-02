@@ -25,6 +25,17 @@ defaults:
     shell: bash
 
 jobs:
+  all-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo test --all-features
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
   build-rust:
     runs-on: ubuntu-latest
     steps:
@@ -236,7 +247,7 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-outdated
-      - run: cargo outdated --root-deps-only --exit-code=1 --ignore rand_core,bincode
+      - run: cargo outdated --root-deps-only --exit-code=1 --ignore rand_core
 
   pants:
     runs-on: ubuntu-latest

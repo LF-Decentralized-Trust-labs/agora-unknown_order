@@ -5,7 +5,7 @@ description = """A crate for working with finite fields where the modulus is of 
 typtical for RSA, Paillier, Hyperelliptic curves, etc.
 """
 documentation = "https://docs.rs/unknown_order"
-edition = "2021"
+edition = "2024"
 exclude = [
     "*.sh",
     ".git",
@@ -18,37 +18,58 @@ license = "Apache-2.0 OR MIT"
 name = "unknown_order"
 readme = "README.md"
 repository = "https://github.com/mikelodder7/unknown_order"
-version = "0.12.0"
+rust-version = "1.88"
+version = "0.13.0"
 
 [features]
-default = ["crypto"]
-crypto = ["crypto-bigint/alloc", "crypto-bigint/serde", "crypto-bigint/default", "crypto-bigint/subtle", "crypto-bigint/getrandom", "crypto-primes", "hex", "multibase", "rand/sys_rng"]
-gmp = ["hex", "rand/default", "rug/num-traits", "num-traits"]
-openssl = ["dep:openssl", "hex", "rand/default"]
-rust = ["glass_pumpkin", "hex", "num-bigint", "num-integer", "num-traits", "rand/default"]
-wasm = ["getrandom", "wasm-bindgen", "serde-wasm-bindgen"]
+default = ["openssl"]
+crypto = ["dep:crypto-bigint", "dep:crypto-primes", "dep:rand"]
+gmp = ["dep:rand", "dep:rug"]
+openssl = ["dep:openssl", "dep:rand"]
+rust = [
+    "dep:rand",
+    "dep:glass_pumpkin",
+    "dep:num-bigint",
+    "dep:num-integer",
+    "dep:num-traits",
+]
+wasm = ["getrandom/wasm_js", "dep:wasm-bindgen"]
 
 [dependencies]
-crypto-bigint = { version = "0.7.0-rc.27", features = ["zeroize"], optional = true }
-crypto-primes = { version = "0.7.0-pre.9", optional = true }
-digest = "0.11"
-getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-glass_pumpkin = { version = "1.10", optional = true }
-hex = { version = "0.4", optional = true }
-multibase = { version = "0.9", default-features = false, optional = true }
-num-bigint = { version = "0.4", optional = true }
-num-integer = { version = "0.1", optional = true }
-num-traits = { version = "0.2", optional = true }
-openssl = { version = "^0.10.75", optional = true }
-rand = { version = "0.10", default-features = false }
-rug = { version = "1.28", default-features = false, features = ["integer", "rand", "std"], optional = true }
-serde = { version = "1.0", features = ["alloc", "serde_derive"] }
-subtle = "2.6"
-wasm-bindgen = { version = "0.2", default-features = false, features = ["serde-serialize"], optional = true }
-zeroize = "1"
-serde-wasm-bindgen = { version = "0.6", optional = true }
+crypto-bigint = { version = "0.7.5", default-features = false, features = [
+    "alloc",
+    "rand_core",
+    "subtle",
+    "zeroize",
+], optional = true }
+crypto-primes = { version = "0.7.2", default-features = false, features = [
+    "alloc",
+], optional = true }
+digest = { version = "0.11", default-features = false }
+getrandom = { version = "0.4", default-features = false, features = ["sys_rng"], optional = true }
+glass_pumpkin = { version = "2.0.0-rc1", default-features = false, optional = true }
+num-bigint = { version = "0.5", default-features = false, optional = true }
+num-integer = { version = "0.1", default-features = false, optional = true }
+num-traits = { version = "0.2", default-features = false, optional = true }
+openssl = { version = "0.10.75", default-features = false, optional = true }
+rand = { version = "0.10", default-features = false, features = [
+    "alloc",
+    "std_rng",
+    "sys_rng",
+], optional = true }
+rand_core = { version = "0.10", default-features = false }
+rug = { version = "1.28", default-features = false, features = ["integer", "std"], optional = true }
+serde = { version = "1.0", default-features = false, features = ["alloc"] }
+subtle = { version = "2.6", default-features = false }
+thiserror = { version = "2", default-features = false }
+wasm-bindgen = { version = "0.2", default-features = false, optional = true }
+zeroize = { version = "1", default-features = false }
 
 [dev-dependencies]
-multibase = "0.9"
+ciborium = "0.2"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = { version = "2.0", features = ["serde"] }
+serde_test = "1.0"
+serde_yaml_ng = "0.10"
+toml = "1.1"

@@ -1,5 +1,9 @@
 #!/bin/bash
 
+set -euo pipefail
+
+echo "Building all backends together"
+cargo build --all-features
 echo "Building w/Crypto-BigInt"
 cargo build --no-default-features --features=crypto
 echo "Building w/Gnu MP Lib"

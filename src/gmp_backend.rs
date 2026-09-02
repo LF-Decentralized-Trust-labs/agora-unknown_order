@@ -2,7 +2,7 @@
     Copyright Michael Lodder. All Rights Reserved.
     SPDX-License-Identifier: Apache-2.0
 */
-use crate::{get_mod, GcdResult};
+use crate::GcdResult;
 use core::{
     cmp::{Eq, Ordering, PartialEq, PartialOrd},
     fmt::{self, Debug, Display},
@@ -12,20 +12,74 @@ use core::{
         ShrAssign, Sub, SubAssign,
     },
 };
-use rand::Rng as RngCore;
-use rug::rand::ThreadRandState;
-use rug::{Assign, Complete, Integer};
+use rand::{
+    SeedableRng,
+    rngs::{StdRng, SysRng},
+};
+use rand_core::Rng as RngCore;
+use rug::{Complete, Integer};
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
+fn default_rng() -> crate::Result<StdRng> {
+    Ok(StdRng::try_from_rng(&mut SysRng)?)
+}
+
+trait GmpShift {
+    fn gmp_shift(self) -> u32;
+}
+
+impl GmpShift for u32 {
+    fn gmp_shift(self) -> u32 {
+        self
+    }
+}
+
+macro_rules! gmp_shift_impl {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl GmpShift for $type {
+                fn gmp_shift(self) -> u32 {
+                    self as u32
+                }
+            }
+        )+
+    };
+}
+
+gmp_shift_impl!(u8, u16, u64, usize, i8, i16, i32, i64, isize);
+
+fn gmp_shl<T: GmpShift>(lhs: &Integer, rhs: T) -> Bn {
+    Bn(lhs.shl(rhs.gmp_shift()).complete())
+}
+
+fn gmp_shl_owned<T: GmpShift>(lhs: Integer, rhs: T) -> Bn {
+    Bn(lhs << rhs.gmp_shift())
+}
+
+fn gmp_shr<T: GmpShift>(lhs: &Integer, rhs: T) -> Bn {
+    Bn(lhs.shr(rhs.gmp_shift()).complete())
+}
+
+fn gmp_shr_owned<T: GmpShift>(lhs: Integer, rhs: T) -> Bn {
+    Bn(lhs >> rhs.gmp_shift())
+}
+
 /// Big number
-#[derive(Ord, PartialOrd, Hash)]
-#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(Ord, PartialOrd)]
 pub struct Bn(pub(crate) Integer);
+
+get_mod_impl!();
+
+impl core::hash::Hash for Bn {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.0, state);
+    }
+}
 
 clone_impl!(|b: &Bn| b.0.clone());
 default_impl!(Integer::new);
-display_impl!();
+display_impl!(native);
 eq_impl!();
 #[cfg(target_pointer_width = "64")]
 from_impl!(Integer::from, i128);
@@ -45,27 +99,27 @@ iter_impl!();
 serdes_impl!();
 zeroize_impl!(|b: &mut Bn| b.0 -= b.0.clone());
 
-binops_impl!(Add, add, AddAssign, add_assign, +, +=);
-binops_impl!(Sub, sub, SubAssign, sub_assign, -, -=);
-binops_impl!(Mul, mul, MulAssign, mul_assign, *, *=);
-binops_impl!(Div, div, DivAssign, div_assign, /, /=);
-binops_impl!(Rem, rem, RemAssign, rem_assign, %, %=);
-neg_impl!(|b: &Integer| Bn(b.neg().complete()));
-shift_impl!(Shl, shl, ShlAssign, shl_assign, |lhs: &Integer, rhs| Bn(
-    lhs.shl(rhs as u32).complete()
-));
-shift_impl!(Shr, shr, ShrAssign, shr_assign, |lhs: &Integer, rhs| Bn(
-    lhs.shr(rhs as u32).complete()
-));
+binops_impl!(Add, add, AddAssign, add_assign, +, +=, |lhs: &Integer, rhs: &Integer| (lhs + rhs).complete());
+binops_impl!(Sub, sub, SubAssign, sub_assign, -, -=, |lhs: &Integer, rhs: &Integer| (lhs - rhs).complete());
+binops_impl!(Mul, mul, MulAssign, mul_assign, *, *=, |lhs: &Integer, rhs: &Integer| (lhs * rhs).complete());
+binops_impl!(Div, div, DivAssign, div_assign, /, /=, |lhs: &Integer, rhs: &Integer| (lhs / rhs).complete());
+binops_impl!(Rem, rem, RemAssign, rem_assign, %, %=, |lhs: &Integer, rhs: &Integer| (lhs % rhs).complete());
+neg_impl!(|b: &Integer| Bn(b.neg().complete()), |b: Integer| Bn(-b));
+shift_impl!(Shl, shl, ShlAssign, shl_assign, gmp_shl, gmp_shl_owned);
+shift_impl!(Shr, shr, ShrAssign, shr_assign, gmp_shr, gmp_shr_owned);
 
 impl ConstantTimeEq for Bn {
     fn ct_eq(&self, other: &Self) -> Choice {
-        let res = self - other;
-        Choice::from(if res.0.cmp0() == Ordering::Equal {
-            1u8
-        } else {
-            0u8
-        })
+        let lhs = self.0.as_limbs();
+        let rhs = other.0.as_limbs();
+        let mut difference = 0;
+        for index in 0..lhs.len().max(rhs.len()) {
+            let lhs_limb = lhs.get(index).copied().map_or(0, core::convert::identity);
+            let rhs_limb = rhs.get(index).copied().map_or(0, core::convert::identity);
+            difference |= lhs_limb ^ rhs_limb;
+        }
+        u8::from(self.0.is_negative()).ct_eq(&u8::from(other.0.is_negative()))
+            & difference.ct_eq(&0)
     }
 }
 
@@ -75,7 +129,9 @@ impl Bn {
     /// which makes a difference when given a negative `self` or `n`.
     /// The result will be in the interval `[0, n)` for `n > 0`
     pub fn modpow(&self, exponent: &Self, n: &Self) -> Self {
-        assert_ne!(n.0, Integer::new());
+        if n.is_zero() {
+            return Self::zero();
+        }
         match exponent.0.cmp0() {
             Ordering::Less => match self.invert(n) {
                 None => Self::zero(),
@@ -97,6 +153,12 @@ impl Bn {
         Self(t)
     }
 
+    pub(crate) fn modadd_assign(&mut self, rhs: &Self, n: &Self) {
+        let modulus = get_mod(n);
+        self.0 += &rhs.0;
+        self.0.modulo_mut(&modulus.0);
+    }
+
     /// Compute (self - rhs) mod n
     pub fn modsub(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
@@ -105,12 +167,24 @@ impl Bn {
         Self(t)
     }
 
+    pub(crate) fn modsub_assign(&mut self, rhs: &Self, n: &Self) {
+        let modulus = get_mod(n);
+        self.0 -= &rhs.0;
+        self.0.modulo_mut(&modulus.0);
+    }
+
     /// Compute (self * rhs) mod n
     pub fn modmul(&self, rhs: &Self, n: &Self) -> Self {
         let nn = get_mod(n);
         let mut t = (&self.0 * &rhs.0).complete();
         t.modulo_mut(&nn.0);
         Self(t)
+    }
+
+    pub(crate) fn modmul_assign(&mut self, rhs: &Self, n: &Self) {
+        let modulus = get_mod(n);
+        self.0 *= &rhs.0;
+        self.0.modulo_mut(&modulus.0);
     }
 
     /// Compute (self * 1/rhs) mod n
@@ -122,6 +196,17 @@ impl Bn {
                 let mut t = (&self.0 * &r.0).complete();
                 t.modulo_mut(&nn.0);
                 Self(t)
+            }
+        }
+    }
+
+    pub(crate) fn moddiv_assign(&mut self, rhs: &Self, n: &Self) {
+        let modulus = get_mod(n);
+        match rhs.invert(&modulus) {
+            None => *self = Self::zero(),
+            Some(inverse) => {
+                self.0 *= inverse.0;
+                self.0.modulo_mut(&modulus.0);
             }
         }
     }
@@ -170,6 +255,11 @@ impl Bn {
         self.0.cmp0() == Ordering::Equal
     }
 
+    /// Return whether this value is negative.
+    pub fn is_negative(&self) -> bool {
+        self.0.is_negative()
+    }
+
     /// self == 1
     pub fn is_one(&self) -> bool {
         self.0 == 1
@@ -191,51 +281,69 @@ impl Bn {
     }
 
     /// Generate a random value less than `n`
-    pub fn random(n: &Self) -> Self {
-        let mut rng = GmpRand::default();
-        Self::from_rng(n, &mut rng)
+    pub fn random(n: &Self) -> crate::Result<Self> {
+        Ok(Self::from_rng(n, &mut default_rng()?))
     }
 
     /// Generate a random value with `n` bits
-    pub fn random_bits(n: u32) -> Self {
-        Self::from_rng_bits(n, &mut rand::rng())
+    pub fn random_bits(n: u32) -> crate::Result<Self> {
+        Ok(Self::from_rng_bits(n, &mut default_rng()?))
     }
 
     /// Generate a random value less than `n` using the specific random number generator
     pub fn from_rng(n: &Self, rng: &mut impl RngCore) -> Self {
-        let mut e_rng = ExternalRand { rng };
-        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
-        let size = n.0.significant_bits();
-        let mut x = Integer::new();
+        if n.is_zero() {
+            return Self::zero();
+        }
+
+        let bits = n.bit_length();
+        let count = bits.div_ceil(8);
+        let excess_bits = count * 8 - bits;
+        let mut bytes = vec![0u8; count];
 
         loop {
-            x.assign(Integer::random_bits(size, &mut rand_state));
-            if x < n.0 {
-                return Self(x);
+            rng.fill_bytes(&mut bytes);
+            if excess_bits > 0 {
+                bytes[0] &= u8::MAX >> excess_bits;
+            }
+            let value = Self::from_slice(&bytes);
+            if value < *n {
+                return value;
             }
         }
     }
 
     /// Generate a random value between [lower, upper)
-    pub fn random_range(lower: &Self, upper: &Self) -> Self {
-        Self::random_range_with_rng(lower, upper, &mut rand::rng())
+    pub fn random_range(lower: &Self, upper: &Self) -> crate::Result<Self> {
+        Self::random_range_with_rng(lower, upper, &mut default_rng()?)
     }
 
     /// Generate a random value between [lower, upper) using the specific random number generator
-    pub fn random_range_with_rng(lower: &Self, upper: &Self, rng: &mut impl RngCore) -> Self {
+    pub fn random_range_with_rng(
+        lower: &Self,
+        upper: &Self,
+        rng: &mut impl RngCore,
+    ) -> crate::Result<Self> {
         if lower >= upper {
-            panic!("lower bound is greater than or equal to upper bound");
+            return Err(crate::Error::InvalidRange);
         }
         let range = upper - lower;
-        lower + Self::from_rng(&range, rng)
+        Ok(lower + Self::from_rng(&range, rng))
     }
 
     /// Generate a random value with `n` bits using the specific random number generator
     pub fn from_rng_bits(n: u32, rng: &mut impl RngCore) -> Self {
+        if n == 0 {
+            return Self::zero();
+        }
         let mut t = vec![0u8; (n as usize).div_ceil(8)];
         rng.fill_bytes(&mut t);
+        let excess_bits = t.len() * 8 - n as usize;
+        if excess_bits > 0 {
+            t[0] &= u8::MAX >> excess_bits;
+        }
         let mut b = Self::from_slice(t);
-        b.0.set_bit(n, true);
+        b.0.set_bit(n - 1, true);
         b
     }
 
@@ -265,12 +373,20 @@ impl Bn {
 
     /// Convert this big number to a big-endian byte sequence and store it in `buffer`.
     /// The sign is not included
-    pub fn copy_bytes_into_buffer(&self, buffer: &mut [u8]) {
-        buffer.copy_from_slice(&self.to_bytes())
+    pub fn copy_bytes_into_buffer(&self, buffer: &mut [u8]) -> crate::Result<()> {
+        let expected = self.bit_length().div_ceil(8);
+        if buffer.len() != expected {
+            return Err(crate::Error::BufferLength {
+                expected,
+                actual: buffer.len(),
+            });
+        }
+        self.0.write_digits(buffer, rug::integer::Order::MsfBe);
+        Ok(())
     }
 
     /// Compute the extended euclid algorithm and return the Bézout coefficients and GCD
-    pub fn extended_gcd(&self, other: &Bn) -> GcdResult {
+    pub fn extended_gcd(&self, other: &Bn) -> GcdResult<Self> {
         let (gcd, x, y) = self.0.extended_gcd_ref(&other.0).complete();
         GcdResult {
             gcd: Self(gcd),
@@ -280,61 +396,49 @@ impl Bn {
     }
 
     /// Generate a safe prime with `size` bits
-    pub fn safe_prime(size: usize) -> Self {
-        Self::safe_prime_from_rng(size, &mut GmpRand::default())
+    pub fn safe_prime(size: usize) -> crate::Result<Self> {
+        Self::safe_prime_from_rng(size, &mut default_rng()?)
     }
 
     /// Generate a safe prime with `size` bits with a user-provided rng
-    pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
+    pub fn safe_prime_from_rng(size: usize, rng: &mut impl RngCore) -> crate::Result<Self> {
         use rug::integer::IsPrime;
 
-        let mut e_rng = ExternalRand { rng };
-        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
-        let mut p = Integer::new();
-
+        crate::error::validate_bit_length(size, 3, u32::MAX as usize)?;
         loop {
-            p.assign(Integer::random_bits((size - 1) as u32, &mut rand_state));
-
-            // Set the MSB bit so that we're sampling from [2^(size - 2), 2^(size - 1))
-            p.set_bit((size - 2) as u32, true);
+            let mut p = Self::from_rng_bits((size - 1) as u32, rng).0;
             p.next_prime_mut();
             p <<= 1;
             p += 1;
 
             // Using 25 to mimic GMP's use of 25 rounds in nextprime
             if let IsPrime::Yes | IsPrime::Probably = p.is_probably_prime(25) {
-                return Self(p);
+                return Ok(Self(p));
             };
         }
     }
 
     /// Generate a prime with `size` bits
-    pub fn prime(size: usize) -> Self {
-        Self::prime_from_rng(size, &mut GmpRand::default())
+    pub fn prime(size: usize) -> crate::Result<Self> {
+        Self::prime_from_rng(size, &mut default_rng()?)
     }
 
     /// Generate a prime with `size` bits with a user-provided rng
-    pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> Self {
-        let mut e_rng = ExternalRand { rng };
-        let mut rand_state = ThreadRandState::new_custom(&mut e_rng);
-        let mut p = Integer::new();
-        p.assign(Integer::random_bits(size as u32, &mut rand_state));
-
-        // Set the MSB bit so that we're sampling from [2^(size - 1), 2^size)
-        p.set_bit((size - 1) as u32, true);
-
+    pub fn prime_from_rng(size: usize, rng: &mut impl RngCore) -> crate::Result<Self> {
+        crate::error::validate_bit_length(size, 2, u32::MAX as usize)?;
+        let mut p = Self::from_rng_bits(size as u32, rng).0;
         p.next_prime_mut();
 
-        Self(p)
+        Ok(Self(p))
     }
 
     /// True if a prime number
-    pub fn is_prime(&self) -> bool {
+    pub fn is_prime(&self) -> crate::Result<bool> {
         use rug::integer::IsPrime;
-        matches!(
+        Ok(matches!(
             self.0.is_probably_prime(25),
             IsPrime::Yes | IsPrime::Probably
-        )
+        ))
     }
 
     /// Simultaneous integer division and modulus
@@ -344,99 +448,61 @@ impl Bn {
     }
 }
 
-struct ExternalRand<'a, T: RngCore> {
-    rng: &'a mut T,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl<T: RngCore> rug::rand::ThreadRandGen for ExternalRand<'_, T> {
-    fn gen(&mut self) -> u32 {
-        self.rng.next_u32()
-    }
-}
-
-struct GmpRand {
-    rng: rand::rngs::ThreadRng,
-}
-
-impl Default for GmpRand {
-    fn default() -> Self {
-        Self { rng: rand::rng() }
-    }
-}
-
-impl rug::rand::ThreadRandGen for GmpRand {
-    fn gen(&mut self) -> u32 {
-        self.rng.next_u32()
-    }
-}
-
-impl rand::TryRng for GmpRand {
-    type Error = core::convert::Infallible;
-
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        Ok(self.rng.next_u32())
+    #[test]
+    fn safe_prime() {
+        let n = Bn::safe_prime(1024).unwrap();
+        assert_eq!(n.0.significant_bits(), 1024);
+        assert!(n.is_prime().unwrap());
+        let sg: Bn = &n >> 1;
+        assert!(sg.is_prime().unwrap());
+        // Make sure it doesn't produce the same prime when called twice
+        let m = Bn::safe_prime(1024).unwrap();
+        assert_eq!(m.0.significant_bits(), 1024);
+        assert!(m.is_prime().unwrap());
+        let sg: Bn = &m >> 1;
+        assert!(sg.is_prime().unwrap());
+        assert_ne!(n, m);
     }
 
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.rng.next_u64())
+    #[test]
+    fn div_rem_test() {
+        let a = Bn::from(11);
+        let b = Bn::from(3);
+        let (q, r) = a.div_rem(&b);
+        assert_eq!(q, Bn::from(3));
+        assert_eq!(r, Bn::from(2));
+
+        let a = Bn::from(23);
+        let b = Bn::from(10);
+        let (q, r) = a.div_rem(&b);
+        assert_eq!(q, Bn::from(2));
+        assert_eq!(r, Bn::from(3));
     }
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-        self.rng.fill_bytes(dest);
-        Ok(())
+    #[test]
+    fn ct_eq() {
+        let a = Bn::from(8);
+        let b = Bn::from(8);
+
+        assert_eq!(a.ct_eq(&b).unwrap_u8(), 1u8);
     }
-}
 
-#[test]
-fn safe_prime() {
-    let n = Bn::safe_prime(1024);
-    assert_eq!(n.0.significant_bits(), 1024);
-    assert!(n.is_prime());
-    let sg: Bn = &n >> 1;
-    assert!(sg.is_prime());
-    // Make sure it doesn't produce the same prime when called twice
-    let m = Bn::safe_prime(1024);
-    assert_eq!(m.0.significant_bits(), 1024);
-    assert!(m.is_prime());
-    let sg: Bn = &m >> 1;
-    assert!(sg.is_prime());
-    assert_ne!(n, m);
-}
+    #[test]
+    fn modpow() {
+        let p = Bn::from(7);
+        let q = Bn::from(13);
 
-#[test]
-fn div_rem_test() {
-    let a = Bn::from(11);
-    let b = Bn::from(3);
-    let (q, r) = a.div_rem(&b);
-    assert_eq!(q, Bn::from(3));
-    assert_eq!(r, Bn::from(2));
+        let n = &p * &q;
 
-    let a = Bn::from(23);
-    let b = Bn::from(10);
-    let (q, r) = a.div_rem(&b);
-    assert_eq!(q, Bn::from(2));
-    assert_eq!(r, Bn::from(3));
-}
+        let e = Bn::zero();
+        let g = Bn::from(3);
 
-#[test]
-fn ct_eq() {
-    let a = Bn::from(8);
-    let b = Bn::from(8);
+        let o = g.modpow(&e, &n);
 
-    assert_eq!(a.ct_eq(&b).unwrap_u8(), 1u8);
-}
-
-#[test]
-fn modpow() {
-    let p = Bn::from(7);
-    let q = Bn::from(13);
-
-    let n = &p * &q;
-
-    let e = Bn::zero();
-    let g = Bn::from(3);
-
-    let o = (&g).modpow(&e, &n);
-
-    assert_eq!(o, Bn::one());
+        assert_eq!(o, Bn::one());
+    }
 }
